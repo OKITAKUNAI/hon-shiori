@@ -2,6 +2,8 @@
 import * as db from './db.js';
 import { resizeImage, imageSize, esc, THUMB_W, THUMB_H, THUMB_VERSION } from './util.js';
 import { makeThumb, regenerateThumbs } from './thumbs.js';
+import * as ocr from './ocr.js';
+import * as share from './share.js';
 
 const TEST_DB = 'hon-shiori-test';
 const list = document.getElementById('results');
@@ -57,6 +59,54 @@ function drawPage(w = 1200, h = 1600) {
     [...line].forEach((ch, i) => g.fillText(ch, x, size * 1.5 + i * size * 1.05));
   });
   return c;
+}
+
+// 横書きのページを描く
+function drawHorizontal(w = 1200, h = 900) {
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const g = c.getContext('2d');
+  g.fillStyle = '#ffffff';
+  g.fillRect(0, 0, w, h);
+  g.fillStyle = '#222';
+  const size = Math.round(w / 26);
+  g.font = `${size}px sans-serif`;
+  g.textBaseline = 'top';
+  SAMPLE.forEach((line, row) => g.fillText(line, size * 1.5, size * 1.5 + row * size * 1.9));
+  return c;
+}
+
+// 2つの文章の一致率（最長共通部分列の長さから計算。空白と改行は無視）
+function similarity(a, b) {
+  a = [...a.replace(/\s/g, '')];
+  b = [...b.replace(/\s/g, '')];
+  if (!a.length || !b.length) return 0;
+  let prev = new Array(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [0];
+    for (let j = 1; j <= b.length; j++) cur[j] = a[i - 1] === b[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1]);
+    prev = cur;
+  }
+  return (2 * prev[b.length]) / (a.length + b.length);
+}
+
+function inspectDb(name) {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(name);
+    req.onsuccess = () => {
+      const d = req.result;
+      const stores = {};
+      if (d.objectStoreNames.length) {
+        const tx = d.transaction([...d.objectStoreNames], 'readonly');
+        for (const s of d.objectStoreNames) stores[s] = [...tx.objectStore(s).indexNames];
+      }
+      const version = d.version;
+      d.close();
+      resolve({ version, stores });
+    };
+    req.onerror = () => reject(req.error);
+  });
 }
 
 const toBlob = (c, type = 'image/jpeg', q = 0.92) => new Promise((r) => c.toBlob(r, type, q));
@@ -154,10 +204,22 @@ async function run() {
   for (const p of fixture.pages) imageHashes[p.id] = await sha256(p.image);
   await createV1Database(TEST_DB, fixture);
 
-  await test('旧版（v1）で保存したデータを、そのまま開ける', async () => {
+  await test(`旧版（v1）で保存したデータを、v${db.DB_VERSION} に移行してそのまま開ける`, async () => {
     const [books, pages, tags] = await Promise.all([db.getAll('books'), db.getAll('pages'), db.getAll('tags')]);
     assert(books.length === 1 && pages.length === 2 && tags.length === 1, `本${books.length} ページ${pages.length} タグ${tags.length}`);
     assert((await db.pagesOfBook('b1')).length === 2, 'bookId の索引で引けない');
+    for (const p of pages) {
+      const orig = fixture.pages.find((x) => x.id === p.id);
+      assert((await sha256(p.image)) === imageHashes[p.id], `${p.id} の元画像が変わった`);
+      assert(p.comment === orig.comment && p.bookId === orig.bookId, `${p.id} の内容が変わった`);
+    }
+    const info = await inspectDb(TEST_DB);
+    assert(info.version === db.DB_VERSION, `版が ${info.version}`);
+    for (const s of ['books', 'pages', 'tags', 'settings', 'marks']) assert(info.stores[s], `${s} がない`);
+    assert(['pageId', 'bookId', 'tagIds'].every((i) => info.stores.marks.includes(i)), `marks の索引: ${info.stores.marks}`);
+    await db.setSetting('test', { a: 1 });
+    assert((await db.getSetting('test')).a === 1, 'settings に保存できない');
+    return `ストア: ${Object.keys(info.stores).join(', ')}`;
   });
 
   let progressCalls = 0;
@@ -203,6 +265,132 @@ async function run() {
     assert(now.comment === '書いた', 'メモが保存されていない');
     assert(now.thumbVersion === THUMB_VERSION, 'サムネの版が古い値に戻った');
     assert((await sha256(now.thumb)) !== (await sha256(stale.thumb)), 'サムネが古いものに戻った');
+  });
+
+  await test('新しく作るデータベースも同じ形になる（v1 を経由しない場合）', async () => {
+    await db.useDatabase(TEST_DB + '-fresh');
+    await db.getAll('books');
+    const info = await inspectDb(TEST_DB + '-fresh');
+    await db.useDatabase(TEST_DB);
+    await deleteDb(TEST_DB + '-fresh');
+    assert(info.version === db.DB_VERSION && ['books', 'pages', 'tags', 'settings', 'marks'].every((s) => info.stores[s]), JSON.stringify(info));
+  });
+
+  // ---- 文字認識 ----
+  await test('読み取り結果の整形：文字の間の空白を取り、段落の中の改行をつなぐ', async () => {
+    const got = ocr.cleanText('し お り を 挟 ん だ\nペ ー ジ に は 、\n\nそ の 日 の 気 持 ち\r\nABC def\nghi');
+    const want = 'しおりを挟んだページには、\nその日の気持ちABC def ghi';
+    assert(got === want, `結果: ${JSON.stringify(got)}`);
+  });
+
+  // 言語データはテストでもCDNから取得する（初回のみ。以後は端末内のキャッシュ）
+  let ocrAvailable = true;
+  await test('縦書き用の言語データを準備できる', async () => {
+    const t0 = performance.now();
+    try {
+      await ocr.prepare('vertical');
+    } catch (e) {
+      ocrAvailable = false;
+      throw e;
+    }
+    assert(await ocr.isReady('vertical'), '準備済みにならない');
+    return `${Math.round(performance.now() - t0)}ms`;
+  });
+
+  await test('canvas に描いた縦書きの見本文を読み取れる（一致率80%以上）', async () => {
+    assert(ocrAvailable, '言語データを準備できなかったので実行しない');
+    const blob = await toBlob(drawPage(1200, 1600), 'image/png');
+    const t0 = performance.now();
+    const text = await ocr.recognize(blob, 'vertical');
+    const want = SAMPLE.join('');
+    const score = similarity(text, want);
+    assert(score >= 0.8, `一致率 ${(score * 100).toFixed(0)}%：${text}`);
+    return `一致率 ${(score * 100).toFixed(0)}%・${Math.round(performance.now() - t0)}ms：${text}`;
+  });
+
+  await test('canvas に描いた横書きの見本文を読み取れる（一致率80%以上）', async () => {
+    await ocr.prepare('horizontal');
+    const blob = await toBlob(drawHorizontal(1200, 900), 'image/png');
+    const text = await ocr.recognize(blob, 'horizontal');
+    const score = similarity(text, SAMPLE.join(''));
+    assert(score >= 0.8, `一致率 ${(score * 100).toFixed(0)}%：${text}`);
+    return `一致率 ${(score * 100).toFixed(0)}%：${text}`;
+  });
+
+  await test('文字認識の間も画面の処理が止まらない（最大の停止が200ms未満）', async () => {
+    const blob = await toBlob(drawPage(1568, 2090), 'image/png');
+    let last = performance.now();
+    let maxGap = 0;
+    let ticks = 0;
+    const timer = setInterval(() => {
+      const now = performance.now();
+      maxGap = Math.max(maxGap, now - last);
+      last = now;
+      ticks++;
+    }, 16);
+    const t0 = performance.now();
+    await ocr.recognize(blob, 'vertical');
+    const ms = performance.now() - t0;
+    clearInterval(timer);
+    assert(maxGap < 200, `最大 ${Math.round(maxGap)}ms 止まった`);
+    return `読み取り ${Math.round(ms)}ms の間に画面側の処理が ${ticks} 回動いた。最大の間隔 ${Math.round(maxGap)}ms`;
+  });
+
+  await test('保存したページを順番待ちに入れると、裏で読み取って結果を保存する', async () => {
+    const image = await toBlob(drawPage(1200, 1600));
+    const now = Date.now();
+    await db.put('pages', { id: 'q1', bookId: 'b1', image, thumb: image, comment: '', tagIds: [], ocrStatus: 'none', ocrText: '', pasteText: '', textSource: null, writingMode: null, createdAt: now, updatedAt: now });
+    const seen = [];
+    const off = ocr.onOcrChange((p) => { if (p.id === 'q1') seen.push(p.ocrStatus); });
+    const done = new Promise((res) => {
+      const off2 = ocr.onOcrChange((p) => { if (p.id === 'q1' && (p.ocrStatus === 'done' || p.ocrStatus === 'failed')) { off2(); res(); } });
+    });
+    await ocr.enqueue('q1');
+    await done;
+    off();
+    const p = await db.get('pages', 'q1');
+    assert(p.ocrStatus === 'done', `状態 ${p.ocrStatus} ${p.ocrError || ''}`);
+    assert(similarity(p.ocrText, SAMPLE.join('')) >= 0.8, `結果：${p.ocrText}`);
+    assert(p.textSource === 'ocr' && p.ocrMode === 'vertical', `textSource=${p.textSource} ocrMode=${p.ocrMode}`);
+    assert(seen.join(',') === 'queued,running,done', `状態の変化: ${seen.join(',')}`);
+    return `状態の変化: ${seen.join(' → ')}`;
+  });
+
+  await test('途中で閉じた読み取り（実行中のまま）は、次の起動で順番待ちに戻して再開する', async () => {
+    await db.update('pages', 'q1', { ocrStatus: 'running', ocrText: '' });
+    const done = new Promise((res) => {
+      const off = ocr.onOcrChange((p) => { if (p.id === 'q1' && p.ocrStatus === 'done') { off(); res(); } });
+    });
+    await ocr.resumeQueue();
+    await done;
+    assert((await db.get('pages', 'q1')).ocrText.length > 10, '読み取り結果がない');
+  });
+
+  await test('貼り付けた文章があれば、どちらを使うか未選択のときは貼り付けを使う', async () => {
+    await db.update('pages', 'q1', { textSource: null, pasteText: 'レンズでコピーした文章', ocrStatus: 'queued' });
+    const done = new Promise((res) => {
+      const off = ocr.onOcrChange((p) => { if (p.id === 'q1' && p.ocrStatus === 'done') { off(); res(); } });
+    });
+    await ocr.enqueue('q1');
+    await done;
+    const p = await db.get('pages', 'q1');
+    assert(p.textSource === 'paste' && ocr.adoptedText(p).text === 'レンズでコピーした文章', `textSource=${p.textSource}`);
+    assert(p.ocrText.length > 10, '読み取り結果も保存されていない');
+  });
+
+  // ---- 共有の受け取り ----
+  await test('共有で受け取った文章と画像を読み出して、消せる', async () => {
+    const id = 'test' + Date.now().toString(36);
+    const cache = await caches.open(share.SHARE_CACHE);
+    const at = (n) => new URL(`./share-inbox/${id}/${n}`, location.href).href;
+    const img = await toBlob(drawPage(300, 400));
+    await cache.put(at('file-0'), new Response(img, { headers: { 'content-type': 'image/jpeg' } }));
+    await cache.put(at('meta.json'), new Response(JSON.stringify({ id, title: '', text: '共有された一文', url: '', files: [{ name: 'a.jpg', type: 'image/jpeg' }] })));
+    const got = await share.readShare(id);
+    assert(share.sharedText(got) === '共有された一文', `文章: ${share.sharedText(got)}`);
+    assert(got.files.length === 1 && got.files[0].size === img.size, '画像を読み出せない');
+    await share.deleteShare(id);
+    assert((await share.readShare(id)) === null, '消えていない');
   });
 
   await db.closeDatabase();

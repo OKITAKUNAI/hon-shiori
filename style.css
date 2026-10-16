@@ -270,6 +270,47 @@ dialog.viewer .hint { color: #fff; text-align: center; margin: 0; font-size: 0.8
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
+/* ---- 文章（文字認識・貼り付け） ---- */
+.ocr-badge {
+  position: absolute; left: 8px; top: 8px; background: #fff; border-radius: 999px;
+  font-size: 0.8rem; line-height: 1; padding: 5px 6px; box-shadow: var(--shadow);
+}
+.ocr-chip { font-size: 0.75rem; font-weight: 500; padding: 1px 10px; border-radius: 999px; background: var(--cream); color: var(--sub); }
+.ocr-chip.st-queued, .ocr-chip.st-running { background: #e9f1ff; color: #4f6fa8; }
+.ocr-chip.st-done { background: #e6f5ec; color: #3f8a5c; }
+.ocr-chip.st-failed { background: #fde8e8; color: var(--danger); }
+.text-tools { justify-content: space-between; margin-top: 0; }
+.inline { display: inline-flex; align-items: center; gap: 6px; }
+.inline select { padding-top: 4px; padding-bottom: 4px; }
+.seg { display: flex; background: var(--cream); border-radius: 999px; padding: 3px; margin: 6px 0 8px; }
+.seg button {
+  flex: 1; border: none; background: transparent; border-radius: 999px; padding: 6px 8px;
+  font-size: 0.88rem; color: var(--sub); cursor: pointer;
+}
+.seg button.on { background: #fff; color: var(--ink); font-weight: 700; box-shadow: var(--shadow); }
+.seg button i { font-style: normal; font-size: 0.7rem; margin-left: 6px; color: #3f8a5c; background: #e6f5ec; border-radius: 999px; padding: 0 6px; }
+.using { font-size: 0.85rem; color: #3f8a5c; font-weight: 700; }
+.err { color: var(--danger); }
+#textSaved { display: block; text-align: right; min-height: 1em; }
+
+.dl-list { list-style: none; padding: 0; margin: 8px 0; }
+.dl-list li { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 0.9rem; }
+.toggle { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 0.9rem; cursor: pointer; }
+.toggle input { width: 20px; height: 20px; accent-color: var(--accent); }
+.dlg-body p { margin: 6px 0; }
+.dl-sizes { margin: 6px 0; padding-left: 1.2em; }
+.meter { height: 8px; background: var(--cream); border-radius: 999px; overflow: hidden; margin-top: 8px; }
+.meter i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+
+/* ---- 共有の受け取り ---- */
+.share-thumbs { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
+.share-thumbs img { height: 120px; border-radius: 10px; }
+.pages.pick { grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 8px; }
+.pick-card { position: relative; border: 3px solid transparent; border-radius: 12px; padding: 0; background: #fbf4ea; cursor: pointer; overflow: hidden; }
+.pick-card img { width: 100%; aspect-ratio: 3 / 4; object-fit: contain; }
+.pick-card.on { border-color: var(--accent); }
+.pick-card .tiny { position: absolute; left: 0; right: 0; bottom: 0; background: rgba(255,255,255,.85); margin: 0; }
+
 /* ---- 試験版の帯 ---- */
 .beta-bar { display: none; }
 html.beta body { background: #eef3fb; }

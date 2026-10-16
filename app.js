@@ -5,6 +5,8 @@ import {
   toast, debounce, THUMB_VERSION,
 } from './util.js';
 import { makeThumb, regenerateThumbs } from './thumbs.js';
+import * as ocr from './ocr.js';
+import * as share from './share.js';
 
 const app = $('#app');
 
@@ -24,6 +26,10 @@ const pref = {
 
 const go = (hash) => { location.hash = hash; };
 
+// 画面を離れるときに片づける処理（裏の処理の見張りなど）
+let viewCleanups = [];
+const onLeave = (fn) => viewCleanups.push(fn);
+
 function tagChip(tag, on = false, extra = '') {
   return `<span class="chip ${on ? 'on' : ''}" style="--c:${tag.color}" ${extra}>${esc(tag.name)}</span>`;
 }
@@ -40,7 +46,9 @@ function formDialog({ title, fields, submit = '保存', danger }) {
           <div class="field"><span class="label">${esc(f.label)}</span>
             <div class="swatches">${TAG_COLORS.map((c) => `
               <label class="swatch" style="--c:${c}"><input type="radio" name="${f.name}" value="${c}" ${c === f.value ? 'checked' : ''}><span></span></label>`).join('')}
-            </div></div>` : `
+            </div></div>` : f.type === 'select' ? `
+          <label class="field"><span class="label">${esc(f.label)}</span>
+            <select name="${f.name}">${f.options.map(([v, l]) => `<option value="${esc(v)}" ${v === f.value ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>` : `
           <label class="field"><span class="label">${esc(f.label)}</span>
             <input name="${f.name}" value="${esc(f.value ?? '')}" placeholder="${esc(f.placeholder ?? '')}" ${f.required ? 'required' : ''} autocomplete="off"></label>`).join('')}
         <div class="row-end">
@@ -65,6 +73,82 @@ function formDialog({ title, fields, submit = '保存', danger }) {
   });
 }
 
+// はい／いいえを聞くダイアログ
+function confirmDialog({ title, body, ok = 'OK', cancel = 'やめる' }) {
+  return new Promise((resolve) => {
+    const dlg = document.createElement('dialog');
+    dlg.className = 'sheet';
+    dlg.innerHTML = `
+      <h3>${esc(title)}</h3>
+      <div class="small dlg-body">${body}</div>
+      <div class="row-end">
+        <button type="button" class="btn ghost" data-no>${esc(cancel)}</button>
+        <button type="button" class="btn primary" data-yes>${esc(ok)}</button>
+      </div>`;
+    document.body.append(dlg);
+    const done = (v) => { dlg.close(); dlg.remove(); resolve(v); };
+    dlg.querySelector('[data-no]').onclick = () => done(false);
+    dlg.querySelector('[data-yes]').onclick = () => done(true);
+    dlg.addEventListener('cancel', (e) => { e.preventDefault(); done(false); });
+    dlg.showModal();
+  });
+}
+
+const PROGRESS_TEXT = {
+  'loading tesseract core': '文字認識エンジンを読み込んでいます',
+  'initializing tesseract': 'エンジンを準備しています',
+  'loading language traineddata': '言語データをダウンロードしています',
+  'initializing api': '仕上げています',
+};
+
+// 文字認識の言語データが端末にあるか確かめ、なければ容量を伝えて同意をもらってからダウンロードする
+async function ensureOcrReady(mode) {
+  if (await ocr.isReady(mode)) return true;
+  const r = await ocr.readiness();
+  const m = ocr.MODES[mode];
+  const total = (r.engine ? 0 : ocr.ENGINE_MB) + m.sizeMB;
+  const ok = await confirmDialog({
+    title: `${m.label}の文字認識を使う準備`,
+    ok: 'ダウンロードする',
+    body: `
+      <p>写真の文章をこのスマホの中で読み取るために、データをダウンロードします。</p>
+      <ul class="dl-sizes">
+        ${r.engine ? '' : `<li>文字認識エンジン（初回だけ）<b>約${ocr.ENGINE_MB}MB</b></li>`}
+        <li>${m.label}用の言語データ <b>約${m.sizeMB}MB</b></li>
+      </ul>
+      <p>合計 <b>約${total.toFixed(1)}MB</b>。Wi-Fi でのダウンロードがおすすめです。<br>
+      一度ダウンロードすれば、以後はオフラインでも使えます。写真や文章が外部に送られることはありません。</p>`,
+  });
+  if (!ok) return false;
+
+  const dlg = document.createElement('dialog');
+  dlg.className = 'sheet';
+  dlg.innerHTML = `<h3>ダウンロード中…</h3><p class="small" id="dlStatus">準備しています</p><div class="meter"><i id="dlBar"></i></div>`;
+  document.body.append(dlg);
+  dlg.addEventListener('cancel', (e) => e.preventDefault());
+  dlg.showModal();
+  try {
+    await ocr.prepare(mode, (msg) => {
+      const label = PROGRESS_TEXT[msg.status];
+      if (!label) return;
+      const pct = Math.round((msg.progress || 0) * 100);
+      dlg.querySelector('#dlStatus').textContent = `${label}… ${pct}%`;
+      dlg.querySelector('#dlBar').style.width = pct + '%';
+    });
+    toast(`${m.label}の文字認識を使えるようになりました`);
+    return true;
+  } catch (e) {
+    console.error(e);
+    toast('ダウンロードできませんでした。通信状態を確かめて、もう一度試してください');
+    return false;
+  } finally {
+    dlg.close();
+    dlg.remove();
+  }
+}
+
+const WRITING_MODE_OPTIONS = [['vertical', '縦書き（ふつうの小説など）'], ['horizontal', '横書き']];
+
 function showImage(blob) {
   const dlg = document.createElement('dialog');
   dlg.className = 'viewer';
@@ -87,6 +171,37 @@ async function touchBook(bookId) {
   await db.update('books', bookId, { updatedAt: Date.now() });
 }
 
+// 写真をページとして保存する。保存が済んだら利用者はすぐ次へ進め、文字認識は裏で順番に行う
+async function addPagesFromFiles(bookId, files, { pasteText = '' } = {}) {
+  const book = await db.get('books', bookId);
+  const auto = await db.getSetting('ocrAuto', true);
+  const base = Date.now();
+  const ids = [];
+  for (const [i, file] of files.entries()) {
+    try {
+      const [image, thumb] = await Promise.all([resizeImage(file, 1568), makeThumb(file)]);
+      const page = {
+        id: uid(), bookId, image, thumb, thumbVersion: THUMB_VERSION, comment: '', tagIds: [],
+        ocrStatus: 'none', ocrText: '', pasteText: i === 0 ? pasteText : '', textSource: null, writingMode: null,
+        createdAt: base + i, updatedAt: base + i,
+      };
+      await db.put('pages', page);
+      ids.push(page.id);
+    } catch (err) {
+      console.error(err);
+      toast('読み込めない画像がありました');
+    }
+  }
+  await touchBook(bookId);
+  const mode = ocr.pageMode({}, book);
+  if (auto && ids.length && (await ocr.isReady(mode))) {
+    for (const id of ids) await ocr.enqueue(id);
+  }
+  return ids;
+}
+
+const OCR_BADGE = { queued: '⏳', running: '🔍', failed: '⚠️' };
+
 // ページのカード。quote（マーカーした一文）を渡すと「ことば」表示（D案）になる：
 // 一文を縦書きで大きく出し、マーカー色をアクセントに、写真は背景に薄く敷く
 function pageCard(p, { book, tagsById, isFav, quote } = {}) {
@@ -96,9 +211,10 @@ function pageCard(p, { book, tagsById, isFav, quote } = {}) {
         <img class="words-bg" src="${blobUrl(p.thumb)}" alt="" loading="lazy">
         <p class="words-text">${esc(quote.text)}</p>`
     : `<div class="thumb"><img src="${blobUrl(p.thumb)}" alt="" loading="lazy">`;
+  const badge = OCR_BADGE[p.ocrStatus];
   return `
-    <a class="page-card" href="#/page/${p.id}">
-      ${visual}${isFav ? '<span class="fav">★</span>' : ''}</div>
+    <a class="page-card" href="#/page/${p.id}" data-page="${p.id}">
+      ${visual}${isFav ? '<span class="fav">★</span>' : ''}${badge ? `<span class="ocr-badge" title="${esc(ocr.STATUS_LABEL[p.ocrStatus])}">${badge}</span>` : ''}</div>
       ${book ? `<div class="pc-book">${esc(book.title)}</div>` : ''}
       ${p.comment ? `<div class="pc-comment">${esc(p.comment)}</div>` : ''}
       ${tags.length ? `<div class="dots">${tags.map((t) => `<i style="background:${t.color}" title="${esc(t.name)}"></i>`).join('')}</div>` : ''}
@@ -158,17 +274,28 @@ async function viewShelf() {
     const v = await formDialog({
       title: '本を追加',
       submit: '追加',
-      fields: [
-        { name: 'title', label: 'タイトル', required: true, placeholder: '例：星の王子さま' },
-        { name: 'author', label: '著者（なくてもOK）', placeholder: '例：サン＝テグジュペリ' },
-      ],
+      fields: BOOK_FIELDS(),
     });
     if (!v?.title) return;
-    const now = Date.now();
-    const book = { id: uid(), title: v.title, author: v.author || '', favoritePageId: null, createdAt: now, updatedAt: now };
-    await db.put('books', book);
+    const book = await createBook(v);
     go('#/book/' + book.id);
   };
+}
+
+const BOOK_FIELDS = (book = {}) => [
+  { name: 'title', label: 'タイトル', required: true, placeholder: '例：星の王子さま', value: book.title },
+  { name: 'author', label: '著者（なくてもOK）', placeholder: '例：サン＝テグジュペリ', value: book.author },
+  { name: 'writingMode', label: '文字の向き（文字認識に使います）', type: 'select', options: WRITING_MODE_OPTIONS, value: book.writingMode || 'vertical' },
+];
+
+async function createBook(v) {
+  const now = Date.now();
+  const book = {
+    id: uid(), title: v.title, author: v.author || '', writingMode: v.writingMode || 'vertical',
+    favoritePageId: null, createdAt: now, updatedAt: now,
+  };
+  await db.put('books', book);
+  return book;
 }
 
 // ---------- 本のページ一覧 ----------
@@ -207,35 +334,26 @@ async function viewBook(id) {
     const files = [...e.target.files];
     if (!files.length) return;
     toast(`${files.length}枚を保存しています…`);
-    const base = Date.now();
-    let firstId;
-    for (const [i, file] of files.entries()) {
-      try {
-        const [image, thumb] = await Promise.all([resizeImage(file, 1568), makeThumb(file)]);
-        const page = {
-          id: uid(), bookId: id, image, thumb, thumbVersion: THUMB_VERSION, comment: '', tagIds: [],
-          createdAt: base + i, updatedAt: base + i,
-        };
-        firstId ??= page.id;
-        await db.put('pages', page);
-      } catch (err) {
-        console.error(err);
-        toast('読み込めない画像がありました');
-      }
-    }
-    await touchBook(id);
-    if (files.length === 1 && firstId) go('#/page/' + firstId);
-    else { toast(`${files.length}枚追加しました`); render(true); }
+    const ids = await addPagesFromFiles(id, files);
+    if (files.length === 1 && ids[0]) go('#/page/' + ids[0]);
+    else { toast(`${ids.length}枚追加しました`); render(true); }
   };
+
+  // 裏の文字認識の進み具合をカードの印に反映する
+  onLeave(ocr.onOcrChange((p) => {
+    if (p.bookId !== id) return;
+    const card = document.querySelector(`[data-page="${p.id}"] .thumb`);
+    if (!card) return;
+    card.querySelector('.ocr-badge')?.remove();
+    const badge = OCR_BADGE[p.ocrStatus];
+    if (badge) card.insertAdjacentHTML('beforeend', `<span class="ocr-badge" title="${esc(ocr.STATUS_LABEL[p.ocrStatus])}">${badge}</span>`);
+  }));
 
   $('#editBook').onclick = async () => {
     const v = await formDialog({
       title: '本の情報',
       danger: 'この本を削除',
-      fields: [
-        { name: 'title', label: 'タイトル', value: book.title, required: true },
-        { name: 'author', label: '著者', value: book.author },
-      ],
+      fields: BOOK_FIELDS(book),
     });
     if (!v) return;
     if (v.__danger) {
@@ -245,12 +363,20 @@ async function viewBook(id) {
       toast('削除しました');
       return go('#/');
     }
-    await db.update('books', id, { title: v.title || book.title, author: v.author, updatedAt: Date.now() });
+    await db.update('books', id, { title: v.title || book.title, author: v.author, writingMode: v.writingMode || 'vertical', updatedAt: Date.now() });
     render(true);
   };
 }
 
 // ---------- 1ページの詳細 ----------
+
+const pageTextTab = new Map(); // ページごとに、最後に開いていた「読み取り結果／貼り付け」のタブ
+
+function useButton(src, adopted) {
+  return adopted === src
+    ? '<span class="using">✓ この文章を使っています</span>'
+    : `<button type="button" class="btn ghost small" data-use="${src}">この文章を使う</button>`;
+}
 
 async function viewPage(id) {
   const page = await db.get('pages', id);
@@ -263,6 +389,13 @@ async function viewPage(id) {
   const prev = siblings[idx - 1];
   const next = siblings[idx + 1];
   const isFav = book.favoritePageId === id;
+  const status = page.ocrStatus || 'none';
+  const hasOcr = !!page.ocrText?.trim();
+  const hasPaste = !!page.pasteText?.trim();
+  // 文章がまだ何もなければ「使用中」は出さない
+  const adopted = hasOcr || hasPaste ? ocr.adoptedText(page).source : null;
+  const bookMode = book.writingMode || 'vertical';
+  const textTab = pageTextTab.get(id) || adopted || 'ocr';
 
   // 変えた項目だけを書き込む（裏で作り直したサムネなどを古い値で上書きしないため）
   const save = async (patch) => {
@@ -284,6 +417,37 @@ async function viewPage(id) {
       ${next ? `<a class="btn ghost small" href="#/page/${next.id}">次 ›</a>` : '<span class="btn ghost small disabled">次 ›</span>'}
     </div>
 
+    <section class="card" id="textCard">
+      <h3 class="sec">文章 <span class="ocr-chip st-${status}" id="ocrStatus">${esc(ocr.STATUS_LABEL[status])}</span></h3>
+      <div class="row text-tools">
+        <label class="inline small">向き
+          <select id="pageMode" aria-label="文字の向き">
+            <option value="" ${page.writingMode ? '' : 'selected'}>本の設定（${ocr.MODES[bookMode].label}）</option>
+            <option value="vertical" ${page.writingMode === 'vertical' ? 'selected' : ''}>縦書き</option>
+            <option value="horizontal" ${page.writingMode === 'horizontal' ? 'selected' : ''}>横書き</option>
+          </select>
+        </label>
+        <button class="btn soft small" id="ocrRun" ${status === 'queued' || status === 'running' ? 'disabled' : ''}>🔍 ${page.ocrText ? 'もう一度読み取る' : '文字を読み取る'}</button>
+      </div>
+      <div class="seg" role="tablist">
+        <button type="button" role="tab" data-tab="ocr" class="${textTab === 'ocr' ? 'on' : ''}">読み取り結果${adopted === 'ocr' ? '<i>使用中</i>' : ''}</button>
+        <button type="button" role="tab" data-tab="paste" class="${textTab === 'paste' ? 'on' : ''}">貼り付け${adopted === 'paste' ? '<i>使用中</i>' : ''}</button>
+      </div>
+      <div data-pane="ocr" ${textTab === 'ocr' ? '' : 'hidden'}>
+        <textarea id="ocrText" rows="6" placeholder="「文字を読み取る」を押すと、写真の文章をここに書き出します">${esc(page.ocrText || '')}</textarea>
+        ${status === 'failed' ? `<p class="tiny err">読み取れませんでした（${esc(page.ocrError || '原因不明')}）。もう一度試すか、貼り付けを使ってください。</p>` : ''}
+        <div class="row">${hasOcr ? useButton('ocr', adopted) : ''}</div>
+      </div>
+      <div data-pane="paste" ${textTab === 'paste' ? '' : 'hidden'}>
+        <textarea id="pasteText" rows="6" placeholder="Googleレンズなどでコピーした文章を、ここに貼り付けます">${esc(page.pasteText || '')}</textarea>
+        <div class="row">
+          <button type="button" class="btn ghost small" id="pasteBtn">📋 クリップボードから貼り付け</button>
+          ${hasPaste ? useButton('paste', adopted) : ''}
+        </div>
+      </div>
+      <span class="saved" id="textSaved"></span>
+    </section>
+
     <section class="card">
       <h3 class="sec">ひとことメモ <span class="saved" id="saved"></span></h3>
       <textarea id="comment" rows="3" placeholder="このページのどこが好き？">${esc(page.comment)}</textarea>
@@ -300,6 +464,78 @@ async function viewPage(id) {
     <div class="row center"><button class="btn ghost danger small" id="delPage">このページを削除</button></div>`;
 
   $('#photo').onclick = () => showImage(page.image);
+
+  // --- 文章（読み取り結果・貼り付け） ---
+  const textSavedMark = () => {
+    const s = $('#textSaved');
+    if (!s) return;
+    s.textContent = '保存しました ✓';
+    setTimeout(() => { if (s.isConnected) s.textContent = ''; }, 1500);
+  };
+  const saveOcrText = debounce(async (v) => { await save({ ocrText: v }); textSavedMark(); }, 600);
+  const savePasteText = debounce(async (v) => {
+    // 貼り付けた文章があり、まだどちらも選んでいなければ貼り付けを使う
+    await save({ pasteText: v, ...(page.textSource ? {} : { textSource: v.trim() ? 'paste' : null }) });
+    textSavedMark();
+  }, 600);
+  $('#ocrText').oninput = (e) => saveOcrText(e.target.value);
+  $('#pasteText').oninput = (e) => savePasteText(e.target.value);
+
+  for (const b of $$('[data-tab]', $('#textCard'))) {
+    b.onclick = () => {
+      pageTextTab.set(id, b.dataset.tab);
+      for (const x of $$('[data-tab]', $('#textCard'))) x.classList.toggle('on', x === b);
+      for (const p of $$('[data-pane]', $('#textCard'))) p.hidden = p.dataset.pane !== b.dataset.tab;
+    };
+  }
+  for (const b of $$('[data-use]')) {
+    b.onclick = async () => {
+      await save({ textSource: b.dataset.use });
+      toast(b.dataset.use === 'ocr' ? '読み取り結果を使います' : '貼り付けた文章を使います');
+      render(true);
+    };
+  }
+  $('#pasteBtn').onclick = async () => {
+    try {
+      const t = await navigator.clipboard.readText();
+      if (!t.trim()) return toast('クリップボードが空です');
+      const ta = $('#pasteText');
+      ta.value = ta.value.trim() ? ta.value.replace(/\s*$/, '\n') + t : t;
+      savePasteText(ta.value);
+    } catch {
+      toast('欄を長押しして「貼り付け」を選んでください');
+      $('#pasteText').focus();
+    }
+  };
+
+  $('#pageMode').onchange = async (e) => {
+    await save({ writingMode: e.target.value || null });
+    toast('向きを変えました。「もう一度読み取る」で読み直せます');
+  };
+
+  $('#ocrRun').onclick = async () => {
+    const mode = ocr.pageMode(page, book);
+    if (page.ocrText?.trim() && !(await confirmDialog({
+      title: 'もう一度読み取りますか？',
+      body: '<p>今の読み取り結果（直した部分も含む）は、新しい結果に置き換わります。貼り付けた文章はそのままです。</p>',
+      ok: '読み取る',
+    }))) return;
+    if (!(await ensureOcrReady(mode))) return;
+    await ocr.enqueue(id);
+    toast('読み取りを始めました。ほかの操作をしていて大丈夫です');
+  };
+
+  // 裏の文字認識の進み具合を反映。入力中なら書きかけを壊さないよう、状態の表示と空欄だけ更新する
+  onLeave(ocr.onOcrChange((p) => {
+    if (p.id !== id) return;
+    Object.assign(page, { ocrStatus: p.ocrStatus, ocrText: p.ocrText, ocrError: p.ocrError, textSource: p.textSource });
+    const typing = document.activeElement?.matches?.('#textCard textarea, #comment');
+    if (!typing) return render(true);
+    const chip = $('#ocrStatus');
+    if (chip) { chip.className = `ocr-chip st-${p.ocrStatus}`; chip.textContent = ocr.STATUS_LABEL[p.ocrStatus]; }
+    const ta = $('#ocrText');
+    if (p.ocrStatus === 'done' && ta && document.activeElement !== ta) ta.value = p.ocrText || '';
+  }));
 
   $('#favBtn').onclick = async () => {
     await db.update('books', book.id, { favoritePageId: isFav ? null : id, updatedAt: Date.now() });
@@ -463,8 +699,23 @@ async function viewSettings() {
     if (est?.usage != null) usage = `${(est.usage / 1024 / 1024).toFixed(1)} MB 使用中`;
   } catch {}
 
+  const ready = await ocr.readiness();
+  const ocrAuto = await db.getSetting('ocrAuto', true);
+
   app.innerHTML = `
     <header class="hero small-hero"><h1>設定</h1></header>
+
+    <section class="card">
+      <h3 class="sec">文字認識（端末内）</h3>
+      <p class="small">写真の文章を、このスマホの中で読み取ります。写真や文章が外部に送られることはありません。</p>
+      <ul class="dl-list">
+        ${Object.entries(ocr.MODES).map(([mode, m]) => `
+          <li><span class="grow">${m.label}用のデータ（約${m.sizeMB}MB）</span>
+            ${ready[mode] ? '<span class="using">✓ ダウンロード済み</span>' : `<button class="btn soft small" data-dl="${mode}">ダウンロード</button>`}</li>`).join('')}
+      </ul>
+      ${ready.engine ? '' : `<p class="muted tiny">初回は文字認識エンジン（約${ocr.ENGINE_MB}MB）も一緒にダウンロードします。</p>`}
+      <label class="toggle"><input type="checkbox" id="ocrAuto" ${ocrAuto ? 'checked' : ''}> 写真を追加したら、自動で読み取る</label>
+    </section>
 
     <section class="card">
       <h3 class="sec">バックアップ</h3>
@@ -477,6 +728,9 @@ async function viewSettings() {
     </section>
 
     <p class="muted tiny center">ほんのしおり v1</p>`;
+
+  for (const b of $$('[data-dl]')) b.onclick = async () => { if (await ensureOcrReady(b.dataset.dl)) render(true); };
+  $('#ocrAuto').onchange = (e) => db.setSetting('ocrAuto', e.target.checked);
 
   $('#exportBtn').onclick = async () => {
     toast('書き出しています…');
@@ -515,6 +769,112 @@ async function viewSettings() {
   };
 }
 
+// ---------- 共有の受け取り ----------
+
+async function viewShare(shareId) {
+  const data = await share.readShare(shareId);
+  if (!data) {
+    app.innerHTML = `<div class="empty"><div class="big">📭</div><p>共有された内容が見つかりませんでした（保存済みか、取り消されています）。</p><a class="btn soft" href="#/">本棚へ</a></div>`;
+    return;
+  }
+  const text = share.sharedText(data);
+  const images = data.files.filter((f) => f.type.startsWith('image/'));
+  const books = (await db.getAll('books')).sort((a, b) => b.updatedAt - a.updatedAt);
+  const lastBook = pref.get('shareBook', '');
+  const selBook = books.find((b) => b.id === lastBook)?.id || books[0]?.id || '';
+
+  app.innerHTML = `
+    <header class="hero small-hero"><h1>共有された内容</h1><p>どの本に保存するか選んでください</p></header>
+    <section class="card">
+      <label class="field"><span class="label">本</span>
+        <select id="shareBook">
+          ${books.map((b) => `<option value="${b.id}" ${b.id === selBook ? 'selected' : ''}>${esc(b.title)}</option>`).join('')}
+          <option value="__new">＋ 新しい本を作る</option>
+        </select></label>
+    </section>
+    ${images.length ? `
+      <section class="card">
+        <h3 class="sec">画像 ${images.length}枚 → 新しいページとして保存</h3>
+        <div class="share-thumbs">${images.map((f) => `<img src="${blobUrl(f)}" alt="">`).join('')}</div>
+        ${text ? '<label class="toggle"><input type="checkbox" id="textToFirst" checked> 文章も1枚目のページに貼り付ける</label>' : ''}
+      </section>` : ''}
+    ${text ? `
+      <section class="card" id="shareTextCard">
+        <h3 class="sec">文章</h3>
+        <textarea id="shareText" rows="6">${esc(text)}</textarea>
+        <div id="pagePick" ${images.length ? 'hidden' : ''}>
+          <p class="small">貼り付けるページを選んでください</p>
+          <div class="pages pick" id="pickGrid"></div>
+        </div>
+      </section>` : ''}
+    <div class="row-end">
+      <button class="btn ghost" id="shareDiscard">保存しない</button>
+      <button class="btn primary" id="shareSave">保存する</button>
+    </div>`;
+
+  let pickedPage = '';
+  const fillPages = async (bookId) => {
+    const grid = $('#pickGrid');
+    if (!grid) return;
+    const pages = bookId && bookId !== '__new' ? await db.pagesOfBook(bookId) : [];
+    pickedPage = '';
+    grid.innerHTML = pages.length
+      ? pages.map((p) => `<button type="button" class="pick-card" data-pick="${p.id}"><img src="${blobUrl(p.thumb)}" alt="">${p.pasteText?.trim() ? '<span class="tiny">貼り付け済み</span>' : ''}</button>`).join('')
+      : '<p class="muted small">この本にはまだページがありません。先に写真を追加してください。</p>';
+    for (const b of $$('[data-pick]', grid)) {
+      b.onclick = () => {
+        pickedPage = b.dataset.pick;
+        for (const x of $$('[data-pick]', grid)) x.classList.toggle('on', x === b);
+      };
+    }
+  };
+  fillPages(selBook);
+  $('#textToFirst')?.addEventListener('change', (e) => { $('#pagePick').hidden = e.target.checked; });
+
+  $('#shareBook').onchange = async (e) => {
+    if (e.target.value !== '__new') return fillPages(e.target.value);
+    const v = await formDialog({ title: '本を追加', submit: '追加', fields: BOOK_FIELDS() });
+    if (!v?.title) { e.target.value = selBook; return; }
+    const b = await createBook(v);
+    e.target.insertAdjacentHTML('afterbegin', `<option value="${b.id}">${esc(b.title)}</option>`);
+    e.target.value = b.id;
+    fillPages(b.id);
+  };
+
+  $('#shareDiscard').onclick = async () => {
+    await share.deleteShare(shareId);
+    go('#/');
+  };
+
+  $('#shareSave').onclick = async () => {
+    const bookId = $('#shareBook').value;
+    if (!bookId || bookId === '__new') return toast('本を選んでください');
+    pref.set('shareBook', bookId);
+    const t = $('#shareText')?.value.trim() || '';
+    const toFirst = images.length && t && $('#textToFirst')?.checked;
+    if (t && !toFirst && !pickedPage) return toast('文章を貼り付けるページを選んでください');
+    $('#shareSave').disabled = true;
+    let target = '#/book/' + bookId;
+    if (images.length) {
+      const ids = await addPagesFromFiles(bookId, images, { pasteText: toFirst ? t : '' });
+      if (toFirst && ids[0]) await db.update('pages', ids[0], { textSource: 'paste' });
+      if (ids.length === 1) target = '#/page/' + ids[0];
+    }
+    if (t && !toFirst) {
+      await db.update('pages', pickedPage, (cur) => ({
+        pasteText: cur.pasteText?.trim() ? cur.pasteText.replace(/\s*$/, '\n') + t : t,
+        textSource: cur.textSource || 'paste',
+        updatedAt: Date.now(),
+      }));
+      await touchBook(bookId);
+      target = '#/page/' + pickedPage;
+    }
+    await share.deleteShare(shareId);
+    toast('保存しました');
+    go(target);
+  };
+}
+
 // ---------- ルーティング ----------
 
 const routes = [
@@ -523,6 +883,7 @@ const routes = [
   [/^#\/tags$/, viewTags, 'tags'],
   [/^#\/tag\/(\w+)$/, viewTag, 'tags'],
   [/^#\/settings$/, viewSettings, 'settings'],
+  [/^#\/share\/(\w+)$/, viewShare, 'shelf'],
   [/^(#\/?)?$/, viewShelf, 'shelf'],
 ];
 
@@ -534,6 +895,8 @@ async function render(keepScroll = false) {
   if (!route) return go('#/');
   const [re, view, tab] = route;
   const y = window.scrollY;
+  viewCleanups.forEach((fn) => { try { fn(); } catch {} });
+  viewCleanups = [];
   const oldUrls = objectUrls;
   objectUrls = [];
   await view(...hash.match(re).slice(1));
@@ -569,7 +932,14 @@ async function startThumbRegen() {
   }
 }
 
-render().then(startThumbRegen);
+window.addEventListener('db-blocked', () => {
+  toast('古い版のアプリが別のタブで開いています。そのタブを閉じると続きます');
+});
+
+render().then(() => {
+  startThumbRegen();
+  ocr.resumeQueue().catch((e) => console.error(e));
+});
 
 // ブラウザにデータを消されにくくする＆ホーム画面アプリ用
 navigator.storage?.persist?.().catch(() => {});

@@ -1,7 +1,10 @@
 // IndexedDB の薄いラッパー。データはすべてこの端末の中だけに保存される。
 import { DB_NAME } from './config.js';
 
-const DB_VERSION = 1;
+// v1: books / pages / tags
+// v2: settings（設定）と marks（マーカー）を追加。既存のデータは変更しない。
+//     ページの OCR 関係の項目（ocrText など）は、使うときに足していく（移行処理は不要）
+export const DB_VERSION = 2;
 
 let dbName = DB_NAME;
 let dbPromise;
@@ -23,12 +26,26 @@ function open() {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(dbName, DB_VERSION);
-    req.onupgradeneeded = () => {
+    req.onupgradeneeded = (e) => {
       const db = req.result;
-      db.createObjectStore('books', { keyPath: 'id' });
-      const pages = db.createObjectStore('pages', { keyPath: 'id' });
-      pages.createIndex('bookId', 'bookId');
-      db.createObjectStore('tags', { keyPath: 'id' });
+      const from = e.oldVersion;
+      if (from < 1) {
+        db.createObjectStore('books', { keyPath: 'id' });
+        const pages = db.createObjectStore('pages', { keyPath: 'id' });
+        pages.createIndex('bookId', 'bookId');
+        db.createObjectStore('tags', { keyPath: 'id' });
+      }
+      if (from < 2) {
+        db.createObjectStore('settings', { keyPath: 'key' });
+        const marks = db.createObjectStore('marks', { keyPath: 'id' });
+        marks.createIndex('pageId', 'pageId');
+        marks.createIndex('bookId', 'bookId');
+        marks.createIndex('tagIds', 'tagIds', { multiEntry: true });
+      }
+    };
+    // 古い版のアプリが別のタブで開いたままだと、更新が待たされる
+    req.onblocked = () => {
+      window.dispatchEvent(new CustomEvent('db-blocked'));
     };
     req.onsuccess = () => {
       const db = req.result;
@@ -79,6 +96,15 @@ export async function update(name, id, patch) {
 
 export async function del(name, id) {
   return wrap((await store(name, 'readwrite')).delete(id));
+}
+
+export async function getSetting(key, fallback) {
+  const row = await get('settings', key);
+  return row ? row.value : fallback;
+}
+
+export async function setSetting(key, value) {
+  return put('settings', { key, value });
 }
 
 export async function pagesOfBook(bookId) {
