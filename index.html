@@ -8,7 +8,15 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="ほんのしおり">
   <title>ほんのしおり</title>
-  <link rel="manifest" href="manifest.json">
+  <link rel="manifest" href="manifest.json" id="manifestLink">
+  <script>
+    // 試験版（パスに -beta を含む／ローカル）は別アプリとして見せる。判定は config.js と同じ
+    if (/-beta(\/|$)/.test(location.pathname) || ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname)) {
+      document.getElementById('manifestLink').href = 'manifest-beta.json';
+      document.title = 'ほんのしおり β';
+      document.documentElement.classList.add('beta');
+    }
+  </script>
   <link rel="icon" href="icon-192.png">
   <link rel="apple-touch-icon" href="icon-192.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -17,6 +25,8 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <div class="beta-bar">β 試験版 ― 本番とはデータが別です</div>
+  <div class="progress-bar" id="progressBar" hidden></div>
   <main id="app"></main>
 
   <nav class="tabbar" id="tabbar">

@@ -16,24 +16,86 @@ export function coverColor(id) {
   return COVER_COLORS[h % COVER_COLORS.length];
 }
 
-// 写真を縮小して JPEG にする（保存容量の節約）
-export async function resizeImage(file, maxSide, quality = 0.85) {
-  const src = URL.createObjectURL(file);
+// サムネの大きさ。カードの最大表示幅（240px）の2.5倍。縦長のページなら 600×800 になる
+export const THUMB_W = 600;
+export const THUMB_H = 800;
+export const THUMB_VERSION = 2;
+
+// 画像を読み込む。写真の向き（EXIF）は反映済みの状態で返す
+async function decodeImage(src) {
+  if ('createImageBitmap' in window) {
+    try {
+      return await createImageBitmap(src, { imageOrientation: 'from-image' });
+    } catch {}
+  }
+  const url = URL.createObjectURL(src);
   try {
     const img = new Image();
-    img.src = src;
+    img.src = url;
     await img.decode();
-    const scale = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
-    const w = Math.round(img.naturalWidth * scale);
-    const h = Math.round(img.naturalHeight * scale);
-    const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
-    canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-    return await new Promise((res) => canvas.toBlob(res, 'image/jpeg', quality));
+    return img;
   } finally {
-    URL.revokeObjectURL(src);
+    URL.revokeObjectURL(url);
   }
+}
+
+function canvasOf(w, h) {
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  return c;
+}
+
+function drawSmooth(source, w, h) {
+  const c = canvasOf(w, h);
+  const g = c.getContext('2d');
+  g.imageSmoothingEnabled = true;
+  g.imageSmoothingQuality = 'high';
+  g.drawImage(source, 0, 0, w, h);
+  return c;
+}
+
+// 半分ずつ縮めてから最後に目的の大きさへ。一気に縮めると文字がギザギザになるため
+function stepDown(source, sw, sh, w, h) {
+  let cur = source;
+  let cw = sw;
+  let ch = sh;
+  while (cw / 2 >= w && ch / 2 >= h) {
+    cw = Math.round(cw / 2);
+    ch = Math.round(ch / 2);
+    cur = drawSmooth(cur, cw, ch);
+  }
+  return drawSmooth(cur, w, h);
+}
+
+// 写真を maxW×maxH に収まるよう縮小して JPEG にする（拡大はしない）
+export async function resizeImage(src, maxW, maxH = maxW, quality = 0.85) {
+  const img = await decodeImage(src);
+  const sw = img.naturalWidth || img.width;
+  const sh = img.naturalHeight || img.height;
+  const scale = Math.min(1, maxW / sw, maxH / sh);
+  const w = Math.max(1, Math.round(sw * scale));
+  const h = Math.max(1, Math.round(sh * scale));
+
+  let out;
+  if (scale < 1 && typeof ImageBitmap !== 'undefined' && img instanceof ImageBitmap) {
+    try {
+      // 対応ブラウザ（Chrome など）では高品質な補間で一度に縮小できる
+      const resized = await createImageBitmap(img, { resizeWidth: w, resizeHeight: h, resizeQuality: 'high' });
+      if (resized.width === w && resized.height === h) out = drawSmooth(resized, w, h);
+      resized.close?.();
+    } catch {}
+  }
+  out ??= stepDown(img, sw, sh, w, h);
+  img.close?.();
+  return new Promise((res, rej) => out.toBlob((b) => (b ? res(b) : rej(new Error('画像を作れませんでした'))), 'image/jpeg', quality));
+}
+
+export async function imageSize(blob) {
+  const img = await decodeImage(blob);
+  const size = { width: img.naturalWidth || img.width, height: img.naturalHeight || img.height };
+  img.close?.();
+  return size;
 }
 
 export function blobToDataURL(blob) {

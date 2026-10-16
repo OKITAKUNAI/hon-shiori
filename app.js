@@ -1,8 +1,10 @@
 import * as db from './db.js';
+import { LS_PREFIX } from './config.js';
 import {
   $, $$, esc, uid, TAG_COLORS, coverColor, resizeImage, blobToDataURL, dataURLToBlob,
-  toast, debounce,
+  toast, debounce, THUMB_VERSION,
 } from './util.js';
+import { makeThumb, regenerateThumbs } from './thumbs.js';
 
 const app = $('#app');
 
@@ -16,8 +18,8 @@ function blobUrl(blob) {
 }
 
 const pref = {
-  get: (k, d) => { try { return localStorage.getItem('hon-shiori:' + k) ?? d; } catch { return d; } },
-  set: (k, v) => { try { localStorage.setItem('hon-shiori:' + k, v); } catch {} },
+  get: (k, d) => { try { return localStorage.getItem(LS_PREFIX + k) ?? d; } catch { return d; } },
+  set: (k, v) => { try { localStorage.setItem(LS_PREFIX + k, v); } catch {} },
 };
 
 const go = (hash) => { location.hash = hash; };
@@ -82,15 +84,21 @@ async function newTag(name) {
 }
 
 async function touchBook(bookId) {
-  const book = await db.get('books', bookId);
-  if (book) await db.put('books', { ...book, updatedAt: Date.now() });
+  await db.update('books', bookId, { updatedAt: Date.now() });
 }
 
-function pageCard(p, { book, tagsById, isFav } = {}) {
+// ページのカード。quote（マーカーした一文）を渡すと「ことば」表示（D案）になる：
+// 一文を縦書きで大きく出し、マーカー色をアクセントに、写真は背景に薄く敷く
+function pageCard(p, { book, tagsById, isFav, quote } = {}) {
   const tags = (p.tagIds || []).map((id) => tagsById?.[id]).filter(Boolean);
+  const visual = quote
+    ? `<div class="thumb words" style="--mc:${quote.color}">
+        <img class="words-bg" src="${blobUrl(p.thumb)}" alt="" loading="lazy">
+        <p class="words-text">${esc(quote.text)}</p>`
+    : `<div class="thumb"><img src="${blobUrl(p.thumb)}" alt="" loading="lazy">`;
   return `
     <a class="page-card" href="#/page/${p.id}">
-      <div class="thumb"><img src="${blobUrl(p.thumb)}" alt="" loading="lazy">${isFav ? '<span class="fav">★</span>' : ''}</div>
+      ${visual}${isFav ? '<span class="fav">★</span>' : ''}</div>
       ${book ? `<div class="pc-book">${esc(book.title)}</div>` : ''}
       ${p.comment ? `<div class="pc-comment">${esc(p.comment)}</div>` : ''}
       ${tags.length ? `<div class="dots">${tags.map((t) => `<i style="background:${t.color}" title="${esc(t.name)}"></i>`).join('')}</div>` : ''}
@@ -203,9 +211,9 @@ async function viewBook(id) {
     let firstId;
     for (const [i, file] of files.entries()) {
       try {
-        const [image, thumb] = await Promise.all([resizeImage(file, 1568), resizeImage(file, 480, 0.8)]);
+        const [image, thumb] = await Promise.all([resizeImage(file, 1568), makeThumb(file)]);
         const page = {
-          id: uid(), bookId: id, image, thumb, comment: '', tagIds: [],
+          id: uid(), bookId: id, image, thumb, thumbVersion: THUMB_VERSION, comment: '', tagIds: [],
           createdAt: base + i, updatedAt: base + i,
         };
         firstId ??= page.id;
@@ -237,7 +245,7 @@ async function viewBook(id) {
       toast('削除しました');
       return go('#/');
     }
-    await db.put('books', { ...book, title: v.title || book.title, author: v.author, updatedAt: Date.now() });
+    await db.update('books', id, { title: v.title || book.title, author: v.author, updatedAt: Date.now() });
     render(true);
   };
 }
@@ -256,9 +264,10 @@ async function viewPage(id) {
   const next = siblings[idx + 1];
   const isFav = book.favoritePageId === id;
 
+  // 変えた項目だけを書き込む（裏で作り直したサムネなどを古い値で上書きしないため）
   const save = async (patch) => {
     Object.assign(page, patch, { updatedAt: Date.now() });
-    await db.put('pages', page);
+    await db.update('pages', id, { ...patch, updatedAt: page.updatedAt });
   };
 
   app.innerHTML = `
@@ -293,7 +302,7 @@ async function viewPage(id) {
   $('#photo').onclick = () => showImage(page.image);
 
   $('#favBtn').onclick = async () => {
-    await db.put('books', { ...book, favoritePageId: isFav ? null : id, updatedAt: Date.now() });
+    await db.update('books', book.id, { favoritePageId: isFav ? null : id, updatedAt: Date.now() });
     toast(isFav ? '表紙をもとに戻しました' : '本棚の表紙にしました ★');
     render(true);
   };
@@ -328,7 +337,7 @@ async function viewPage(id) {
   $('#delPage').onclick = async () => {
     if (!confirm('このページを削除しますか？（写真とメモも消えます）')) return;
     await db.del('pages', id);
-    if (isFav) await db.put('books', { ...book, favoritePageId: null, updatedAt: Date.now() });
+    if (isFav) await db.update('books', book.id, { favoritePageId: null, updatedAt: Date.now() });
     toast('削除しました');
     go('#/book/' + book.id);
   };
@@ -395,13 +404,13 @@ async function editTag(tag, n) {
   if (v.__danger) {
     if (!confirm(`タグ「${tag.name}」を削除しますか？${n ? `（${n}ページからはずれます。ページ自体は消えません）` : ''}`)) return;
     for (const p of await db.getAll('pages')) {
-      if (p.tagIds?.includes(tag.id)) await db.put('pages', { ...p, tagIds: p.tagIds.filter((t) => t !== tag.id) });
+      if (p.tagIds?.includes(tag.id)) await db.update('pages', p.id, (cur) => ({ tagIds: cur.tagIds.filter((t) => t !== tag.id) }));
     }
     await db.del('tags', tag.id);
     toast('削除しました');
     return location.hash === '#/tags' ? render(true) : go('#/tags');
   }
-  await db.put('tags', { ...tag, name: v.name || tag.name, color: v.color || tag.color });
+  await db.update('tags', tag.id, { name: v.name || tag.name, color: v.color || tag.color });
   render(true);
 }
 
@@ -499,6 +508,7 @@ async function viewSettings() {
       }
       toast('読み込みました');
       go('#/');
+      startThumbRegen();
     } catch (err) {
       toast('読み込めませんでした：' + err.message);
     }
@@ -534,7 +544,32 @@ async function render(keepScroll = false) {
 }
 
 window.addEventListener('hashchange', () => render(false));
-render();
+
+// 古いサムネイルを裏で作り直し、画面上部に進み具合を出す
+let regenRunning = false;
+async function startThumbRegen() {
+  if (regenRunning) return;
+  regenRunning = true;
+  const bar = $('#progressBar');
+  try {
+    const r = await regenerateThumbs((done, total) => {
+      bar.hidden = false;
+      bar.innerHTML = `<span>サムネイルをきれいにしています… ${done} / ${total}</span><i style="width:${Math.round((done / total) * 100)}%"></i>`;
+    });
+    if (r.total) {
+      toast(r.failed ? `サムネイルを更新しました（${r.failed}枚は次回やり直します）` : 'サムネイルをきれいにしました');
+      // 入力中の画面（ページ詳細など）は描き直さない
+      if (/^(#\/?|#\/book\/\w+|#\/tag\/\w+)?$/.test(location.hash)) render(true);
+    }
+  } catch (e) {
+    console.error(e);
+  } finally {
+    bar.hidden = true;
+    regenRunning = false;
+  }
+}
+
+render().then(startThumbRegen);
 
 // ブラウザにデータを消されにくくする＆ホーム画面アプリ用
 navigator.storage?.persist?.().catch(() => {});

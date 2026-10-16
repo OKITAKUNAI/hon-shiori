@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>しおり テスト</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    body { padding: 16px; max-width: 760px; margin: 0 auto; }
+    h1 { font-size: 1.3rem; }
+    #results { list-style: none; padding: 0; font-size: 0.9rem; }
+    #results li { padding: 6px 10px; border-radius: 10px; margin: 4px 0; background: #fff; }
+    #results li.pass::before { content: '✅ '; }
+    #results li.fail { background: #fde8e8; }
+    #results li.fail::before { content: '❌ '; }
+    #results small { display: block; color: var(--sub); white-space: pre-wrap; }
+    #summary { font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h1>ほんのしおり 自動テスト</h1>
+  <p class="muted small">テスト専用のデータベース（hon-shiori-test）だけを使います。本番・試験版のデータには触れません。見本の画像はすべて canvas で描いたものです。</p>
+  <p id="summary">実行中…</p>
+  <ul id="results"></ul>
+
+  <h2 class="sec">カードの見た目（D案の見本）</h2>
+  <div class="pages" id="preview"></div>
+
+  <script type="module" src="tests.js"></script>
+</body>
+</html>

@@ -138,13 +138,35 @@ select {
 .add-photos small { color: var(--sub); }
 
 /* ---- ページのカード ---- */
+/* カードの最大幅は 240px（サムネは幅600pxで作るので、画素密度2.5倍の画面まで粗くならない） */
+/* （列の上限を grid で指定すると列数が減るので、上限はカード側にかける） */
 .pages { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
 .page-card {
   display: block; background: var(--card); border-radius: var(--radius); overflow: hidden;
-  box-shadow: var(--shadow); padding-bottom: 8px;
+  box-shadow: var(--shadow); padding-bottom: 8px; position: relative;
+  width: 100%; max-width: 240px; justify-self: center;
 }
-.thumb { position: relative; aspect-ratio: 4 / 5; background: var(--cream); }
-.thumb img { width: 100%; height: 100%; object-fit: cover; }
+/* ページ全体が見えるよう、切り抜かずに収める（余白は紙の色） */
+.thumb { position: relative; aspect-ratio: 3 / 4; background: #fbf4ea; }
+.thumb img { width: 100%; height: 100%; object-fit: contain; }
+
+/* 「ことば」表示（D案）：マーカーした一文を縦書きで大きく、写真は背景に薄く */
+.thumb.words { background: #fffaf3; overflow: hidden; display: flex; justify-content: center; }
+.thumb.words .words-bg { position: absolute; inset: 0; object-fit: cover; opacity: 0.12; filter: grayscale(1); }
+.thumb.words::before {
+  content: ''; position: absolute; top: 12px; bottom: 12px; right: 14px; width: 4px; border-radius: 4px;
+  background: var(--mc, var(--accent));
+}
+.words-text {
+  position: relative; margin: 0; padding: 14px 26px 14px 10px; height: 100%;
+  writing-mode: vertical-rl; text-orientation: mixed;
+  font-family: 'Zen Old Mincho', 'Hiragino Mincho ProN', 'Yu Mincho', serif;
+  font-size: 1.05rem; line-height: 1.75; letter-spacing: 0.08em; color: var(--ink);
+  overflow: hidden;
+  display: -webkit-box; -webkit-box-orient: horizontal;
+  text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--mc, var(--accent)) 70%, transparent);
+  text-decoration-thickness: 0.35em; text-underline-offset: -0.15em; text-decoration-skip-ink: none;
+}
 .fav {
   position: absolute; top: 8px; right: 8px; background: #fff; color: #f5b335;
   width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center;
@@ -247,3 +269,19 @@ dialog.viewer .hint { color: #fff; text-align: center; margin: 0; font-size: 0.8
   font-size: 0.88rem; transition: all .25s; max-width: calc(100vw - 32px); text-align: center;
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+/* ---- 試験版の帯 ---- */
+.beta-bar { display: none; }
+html.beta body { background: #eef3fb; }
+html.beta .beta-bar {
+  display: block; position: sticky; top: 0; z-index: 15; text-align: center;
+  background: #4f6fa8; color: #fff; font-size: 0.78rem; padding: calc(env(safe-area-inset-top) + 3px) 8px 3px;
+}
+
+/* ---- 裏の処理の進み具合 ---- */
+.progress-bar {
+  position: sticky; top: 0; z-index: 14; overflow: hidden;
+  background: #fff8ec; border-bottom: 1px solid var(--line);
+  font-size: 0.8rem; color: var(--sub); text-align: center; padding: 4px 8px;
+}
+.progress-bar i { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--accent); transition: width .2s; }
