@@ -7,9 +7,12 @@ let dbPromise;
 function open() {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    // 戻し用：版を指定せずに開く。新しい版（v2 以降）のデータベースもそのまま開け、
+    // 旧版が使う books / pages / tags だけを読み書きする（新しい版で増えた項目やストアは残す）
+    const req = indexedDB.open(DB_NAME);
     req.onupgradeneeded = () => {
       const db = req.result;
+      if (db.objectStoreNames.contains('books')) return;
       db.createObjectStore('books', { keyPath: 'id' });
       const pages = db.createObjectStore('pages', { keyPath: 'id' });
       pages.createIndex('bookId', 'bookId');
