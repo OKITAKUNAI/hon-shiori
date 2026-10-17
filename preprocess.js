@@ -135,8 +135,10 @@ export function downscale(g, w, h, maxSide) {
   return { g: out, w: W, h: H, s };
 }
 
+// 範囲の外は、いちばん近い端の画素で埋める（白で埋めると、境目が線として文字に見えてしまうため）
 function bilinear(g, w, h, x, y) {
-  if (x < 0 || y < 0 || x > w - 1 || y > h - 1) return 255;
+  x = x < 0 ? 0 : x > w - 1 ? w - 1 : x;
+  y = y < 0 ? 0 : y > h - 1 ? h - 1 : y;
   const x0 = x | 0;
   const y0 = y | 0;
   const x1 = Math.min(w - 1, x0 + 1);
@@ -199,7 +201,7 @@ function homography(src, dst) {
   return A.map((row, i) => row[8] / row[i]);
 }
 
-// 角度 deg だけ回転する（反時計回りを正。はみ出さないよう広げ、余白は白）
+// 角度 deg だけ回転する（はみ出さないよう広げ、余白は端の画素で埋める）
 export function rotateGray(g, w, h, deg) {
   if (!deg) return { g, w, h };
   const t = (deg * Math.PI) / 180;
@@ -327,48 +329,73 @@ export function estimateSkew(ink, w, h, vertical = true, { range = 6, maxPoints 
 export function removeRuby(ink, w, h, vertical = true, { ratio = 0.6 } = {}) {
   const p = profile(ink, w, h, vertical);
   const span = vertical ? h : w;
-  let bands = findBands(p, Math.max(1, Math.round(span * 0.003)), 0);
-  if (bands.length < 2) return { lineWidth: 0, removed: [] };
+  const raw = findBands(p, Math.max(1, Math.round(span * 0.003)), 0);
+  if (raw.length < 2) return { lineWidth: 0, removed: [] };
   // 本文の行：黒画素が多い帯の幅の中央値を行の幅とする
-  const inkMed = median(bands.map((b) => b.ink));
-  const body = bands.filter((b) => b.ink >= inkMed * 0.5);
-  const lineWidth = median(body.map((b) => b.width));
-  // ルビが本文に接していて1つの帯になっているときは、帯の中の谷で分ける
-  const split = [];
-  for (const b of bands) {
-    if (b.width > lineWidth * 1.3) {
+  const inkMed = median(raw.map((b) => b.ink));
+  const lineWidth = median(raw.filter((b) => b.ink >= inkMed * 0.5).map((b) => b.width));
+
+  // ルビが本文に接していたり、とじ目の近くで行の間が詰まっていたりして、いくつかの行（とルビ）が1つの帯になっているときは、
+  // 「左右の山のうち低いほうの半分以下まで下がる谷」のうち、いちばん深いところで分けることを繰り返す
+  const peakOf = (a, b) => { let m = 0; for (let i = a; i <= b; i++) m = Math.max(m, p[i]); return m; };
+  const pieces = [];
+  const splitBand = (a, b) => {
+    if (b - a + 1 > lineWidth * 1.3) {
       let cut = -1;
-      let low = Infinity;
-      let peak = 0;
-      for (let i = b.a; i <= b.b; i++) peak = Math.max(peak, p[i]);
-      for (let i = b.a + Math.round(lineWidth * 0.6); i <= b.b - Math.round(lineWidth * 0.15); i++) if (p[i] < low) { low = p[i]; cut = i; }
-      for (let i = b.a + Math.round(lineWidth * 0.15); i <= b.b - Math.round(lineWidth * 0.6); i++) if (p[i] < low) { low = p[i]; cut = i; }
-      if (cut > b.a && cut < b.b && low <= peak * 0.12) {
-        const left = { a: b.a, b: cut - 1 };
-        const right = { a: cut + 1, b: b.b };
-        for (const part of [left, right]) {
-          let s = 0;
-          for (let i = part.a; i <= part.b; i++) s += p[i];
-          split.push({ ...part, ink: s, width: part.b - part.a + 1 });
-        }
-        continue;
+      let best = 1;
+      for (let i = a + 3; i <= b - 3; i++) {
+        if (!(p[i] <= p[i - 1] && p[i] <= p[i + 1])) continue;
+        const depth = p[i] / Math.max(1, Math.min(peakOf(a, i), peakOf(i, b)));
+        if (depth <= 0.5 && depth < best) { best = depth; cut = i; }
       }
+      if (cut > 0) { splitBand(a, cut - 1); splitBand(cut + 1, b); return; }
     }
-    split.push(b);
+    pieces.push({ a, b });
+  };
+  for (const r of raw) splitBand(r.a, r.b);
+
+  // 分けた部分ごとに、山の高さの半分以上ある幅（芯の幅）と山の高さを求める
+  for (const x of pieces) {
+    x.peak = peakOf(x.a, x.b);
+    let lo = x.b;
+    let hi = x.a;
+    for (let i = x.a; i <= x.b; i++) if (p[i] >= x.peak / 2) { lo = Math.min(lo, i); hi = Math.max(hi, i); }
+    x.core = hi - lo + 1;
   }
-  bands = split;
-  const isBody = (b) => b.width >= lineWidth * ratio;
+  // 本文の行：芯の幅が行の幅の6割以上、または山が本文の行の山の6割以上（ルビの列は文字がまばらで山が低い）
+  const bodyPeak = median(pieces.filter((x) => x.core >= lineWidth * ratio).map((x) => x.peak)) || 1;
+  const isBody = (x) => x.core >= lineWidth * ratio || x.peak >= bodyPeak * 0.6;
   const removed = [];
-  for (let i = 0; i < bands.length; i++) {
-    const b = bands[i];
-    if (isBody(b)) continue;
+  pieces.forEach((x, i) => {
+    if (isBody(x)) return;
     // 隣（すき間が行の幅の8割以内）に本文の行があるものだけをルビとみなす
-    const near = bands.some((o, j) => j !== i && isBody(o) && Math.min(Math.abs(o.a - b.b), Math.abs(b.a - o.b)) <= lineWidth * 0.8);
-    if (!near) continue;
-    removed.push({ a: b.a, b: b.b });
-    if (vertical) { for (let y = 0; y < h; y++) for (let x = b.a; x <= b.b; x++) ink[y * w + x] = 0; } else { for (let y = b.a; y <= b.b; y++) ink.fill(0, y * w, y * w + w); }
-  }
+    const near = pieces.some((o, j) => j !== i && isBody(o) && Math.min(Math.abs(o.a - x.b), Math.abs(x.a - o.b)) <= lineWidth * 0.8);
+    if (!near) return;
+    removed.push({ a: x.a, b: x.b });
+    if (vertical) { for (let y = 0; y < h; y++) for (let xx = x.a; xx <= x.b; xx++) ink[y * w + xx] = 0; } else { for (let y = x.a; y <= x.b; y++) ink.fill(0, y * w, y * w + w); }
+  });
   return { lineWidth, removed };
+}
+
+// 本文の範囲を、元の写真の上の四隅（左上・右上・右下・左下。画素の座標）として推定する。
+// 写真が傾いていると、柱と本文の間のすき間が分布に現れないので、先に傾きを直した画像で範囲を探し、
+// 見つけた長方形の四隅を元の写真の座標に戻す（ページの傾きに沿った四角形になる）
+export function autoQuad(g, w, h, vertical = true) {
+  const small = downscale(g, w, h, 800);
+  const angle = estimateSkew(binarizeSauvola(small.g, small.w, small.h), small.w, small.h, vertical);
+  const rot = rotateGray(small.g, small.w, small.h, angle);
+  const b = estimateTextBox(binarizeSauvola(rot.g, rot.w, rot.h), rot.w, rot.h, vertical);
+  const t = (angle * Math.PI) / 180;
+  const c = Math.cos(t);
+  const sn = Math.sin(t);
+  // rotateGray と同じ対応：回転後の (x, y) → 回転前の座標
+  const back = (x, y) => {
+    const dx = x - rot.w / 2;
+    const dy = y - rot.h / 2;
+    return [(small.w / 2 + dx * c - dy * sn) / small.s, (small.h / 2 + dx * sn + dy * c) / small.s];
+  };
+  const clamp = ([x, y]) => [Math.min(w, Math.max(0, x)), Math.min(h, Math.max(0, y))];
+  return { angle, quad: [back(b.x0, b.y0), back(b.x1, b.y0), back(b.x1, b.y1), back(b.x0, b.y1)].map(clamp) };
 }
 
 // ---------- まとめて実行 ----------
@@ -391,19 +418,18 @@ export function runPipeline(g, w, h, options = {}) {
     ({ g, w, h } = warpQuad(g, w, h, quad));
     info.crop = 'manual';
   } else if (o.crop === 'auto') {
-    const small = downscale(g, w, h, 800);
-    const sInk = binarizeSauvola(small.g, small.w, small.h);
-    const b = estimateTextBox(sInk, small.w, small.h, o.vertical);
-    const box = { x0: b.x0 / small.s, y0: b.y0 / small.s, x1: b.x1 / small.s, y1: b.y1 / small.s };
-    ({ g, w, h } = cropRect(g, w, h, box));
+    // 傾きを直した向きで本文の範囲を探し、その四角形を長方形に引き伸ばす（傾きもここで直る）
+    const a = autoQuad(g, w, h, o.vertical);
     info.crop = 'auto';
-    info.box = [box.x0, box.y0, box.x1, box.y1].map((v, i) => +(v / info.size[i % 2]).toFixed(4));
+    info.quad = a.quad.map(([x, y]) => [+(x / w).toFixed(4), +(y / h).toFixed(4)]);
+    info.autoAngle = a.angle;
+    ({ g, w, h } = warpQuad(g, w, h, a.quad));
   }
 
   // 2. コントラスト調整
   info.range = normalizeContrast(g);
 
-  // 3. 傾き補正
+  // 3. 傾き補正（自動の切り抜きで直したあとに残ったぶんも、ここで直す）
   if (o.deskew) {
     const small = downscale(g, w, h, 900);
     const angle = estimateSkew(binarizeSauvola(small.g, small.w, small.h), small.w, small.h, o.vertical);
@@ -528,18 +554,13 @@ export async function preprocessForOcr(blob, options = {}) {
 // 写真から本文の範囲（四隅。0〜1 の割合）を自動で推定する。読み取り範囲の画面の初期値に使う
 export async function suggestCrop(blob, vertical = true) {
   const bmp = await createImageBitmap(blob, { imageOrientation: 'from-image' });
-  const scale = Math.min(1, 800 / Math.max(bmp.width, bmp.height));
+  const scale = Math.min(1, 1000 / Math.max(bmp.width, bmp.height));
   const W = Math.round(bmp.width * scale);
   const H = Math.round(bmp.height * scale);
   const c = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(W, H) : Object.assign(document.createElement('canvas'), { width: W, height: H });
   const cg = c.getContext('2d', { willReadFrequently: true });
   cg.drawImage(bmp, 0, 0, W, H);
   bmp.close?.();
-  const g = toGray(cg.getImageData(0, 0, W, H).data, W, H);
-  const b = estimateTextBox(binarizeSauvola(g, W, H), W, H, vertical);
-  const x0 = b.x0 / W;
-  const y0 = b.y0 / H;
-  const x1 = b.x1 / W;
-  const y1 = b.y1 / H;
-  return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+  const { quad } = autoQuad(toGray(cg.getImageData(0, 0, W, H).data, W, H), W, H, vertical);
+  return quad.map(([x, y]) => [+(x / W).toFixed(4), +(y / H).toFixed(4)]);
 }

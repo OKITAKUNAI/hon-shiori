@@ -669,9 +669,11 @@ async function run() {
     const res = P.runPipeline(grayOf(hard.canvas), HW, HH, { crop: 'auto', deskew: true, vertical: true });
     const sm = P.downscale(res.g, res.w, res.h, 900);
     const after = P.estimateSkew(P.binarizeSauvola(sm.g, sm.w, sm.h), sm.w, sm.h, true);
-    assert(Math.abs(res.info.angle) >= 1 && Math.abs(res.info.angle) <= 2, `推定した角度 ${res.info.angle}`);
+    // 自動の切り抜きの段階で傾きを推定して直し（autoAngle）、残ったぶんを傾き補正の段階で直す（angle）
+    const total = res.info.autoAngle + (res.info.angle || 0);
+    assert(Math.abs(total) >= 1 && Math.abs(total) <= 2, `推定した角度 ${res.info.autoAngle} + ${res.info.angle}`);
     assert(Math.abs(after) <= 0.3, `補正後に残った傾き ${after}`);
-    return `推定 ${res.info.angle}度 → 補正後に残った傾き ${after}度`;
+    return `推定 ${res.info.autoAngle}度（切り抜きの段階）＋ ${res.info.angle}度（残り）→ 補正後に残った傾き ${after}度`;
   });
 
   await test('前処理3：影のある紙の部分を、Sauvola法は文字と間違えない（大津の方法と比べる）', async () => {
