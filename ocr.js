@@ -6,7 +6,7 @@ import * as db from './db.js';
 import { APP_ID } from './config.js';
 import { preprocessForOcr } from './preprocess.js';
 import { updatePageText } from './marks.js';
-export { sourceOf, sourceText, adoptedText } from './text.js';
+export { sourceOf, sourceText, adoptedText, editedOf } from './text.js';
 
 // フォルダ名にバージョンを入れている。sw.js は vendor/ を「中身が変わらないもの」として長くキャッシュするので、
 // 更新するときは新しいフォルダ名にすること

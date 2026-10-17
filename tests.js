@@ -9,6 +9,7 @@ import { makeAnchor, reanchor, isPlaced } from './anchor.js';
 import * as marksMod from './marks.js';
 import { renderText } from './textview.js';
 import { exportBackup, importBackup } from './backup.js';
+import { editedOf } from './text.js';
 
 const TEST_DB = 'hon-shiori-test';
 const list = document.getElementById('results');
@@ -376,7 +377,7 @@ async function run() {
     assert(p.ocrStatus === 'done', `状態 ${p.ocrStatus} ${p.ocrError || ''}`);
     assert(similarity(p.ocrText, SAMPLE.join('')) >= 0.8, `結果：${p.ocrText}`);
     assert(p.textSource === 'ocr' && p.ocrLang === 'jpn_vert' && p.ocrPsm === '5', `textSource=${p.textSource} ocrLang=${p.ocrLang} ocrPsm=${p.ocrPsm}`);
-    assert(p.editedText === undefined || p.editedText === '', '手で直した文章に書き込まれた');
+    assert(!editedOf(p, 'ocr') && !editedOf(p, 'paste'), '手で直した文章に書き込まれた');
     assert(seen.join(',') === 'queued,running,done', `状態の変化: ${seen.join(',')}`);
     return `状態の変化: ${seen.join(' → ')}`;
   });
@@ -463,7 +464,7 @@ async function run() {
 
   await test('写真のないページは読み取りの順番待ちに入らない', async () => {
     const now = Date.now();
-    await db.put('pages', { id: 't1', bookId: 'b1', image: null, thumb: null, comment: '', tagIds: [], ocrStatus: 'none', ocrText: '', editedText: '', pasteText: '文章だけ', textSource: 'paste', createdAt: now, updatedAt: now });
+    await db.put('pages', { id: 't1', bookId: 'b1', image: null, thumb: null, comment: '', tagIds: [], ocrStatus: 'none', ocrText: '', editedText: { ocr: '', paste: '' }, pasteText: '文章だけ', textSource: 'paste', createdAt: now, updatedAt: now });
     await ocr.enqueue('t1');
     const p = await db.get('pages', 't1');
     assert(p.ocrStatus === 'none', `状態 ${p.ocrStatus}`);
@@ -471,7 +472,7 @@ async function run() {
   });
 
   await test('読み取りの進捗率が通知され、もう一度読み取っても手で直した文章は上書きしない', async () => {
-    await db.update('pages', 'q1', { editedText: '手で直した文章', ocrText: '古い原文', textSource: 'ocr' });
+    await db.update('pages', 'q1', { editedText: { ocr: '手で直した文章', paste: '' }, ocrText: '古い原文', textSource: 'ocr' });
     const progress = [];
     const offP = ocr.onOcrProgress((pid, v) => { if (pid === 'q1') progress.push(v); });
     const done = new Promise((res) => {
@@ -481,7 +482,7 @@ async function run() {
     await done;
     offP();
     const p = await db.get('pages', 'q1');
-    assert(p.editedText === '手で直した文章', `editedText が ${p.editedText}`);
+    assert(editedOf(p, 'ocr') === '手で直した文章', `editedText が ${JSON.stringify(p.editedText)}`);
     assert(p.ocrText !== '古い原文' && similarity(p.ocrText, SAMPLE.join('')) >= 0.8, '原文が更新されていない');
     assert(ocr.adoptedText(p).text === '手で直した文章', '画面に出す文章が手直しになっていない');
     assert(progress.length >= 2 && Math.max(...progress) > 0.5, `進捗の通知: ${progress.length}回 最大${Math.max(0, ...progress)}`);
@@ -491,7 +492,7 @@ async function run() {
   await test('読み取り中にキャンセルでき、そのあともワーカーを作り直して読み取れる', async () => {
     const big = await toBlob(drawPage(1568, 2090));
     const now = Date.now();
-    await db.put('pages', { id: 'c1', bookId: 'b1', image: big, thumb: big, comment: '', tagIds: [], ocrStatus: 'none', ocrText: '', editedText: '', pasteText: '', textSource: null, createdAt: now + 100, updatedAt: now });
+    await db.put('pages', { id: 'c1', bookId: 'b1', image: big, thumb: big, comment: '', tagIds: [], ocrStatus: 'none', ocrText: '', editedText: { ocr: '', paste: '' }, pasteText: '', textSource: null, createdAt: now + 100, updatedAt: now });
     const running = new Promise((res) => {
       const off = ocr.onOcrProgress((pid) => { if (pid === 'c1') { off(); res(); } });
     });
@@ -612,7 +613,7 @@ async function run() {
 
   await test('マーカーを保存し、文章を手直しすると付け直され、消した一文は位置不明になる（保存形式はフェーズ5の完成形）', async () => {
     const now = Date.now();
-    await db.put('pages', { id: 'mk1', bookId: 'b1', image: null, thumb: null, comment: '', tagIds: [], ocrStatus: 'none', ocrText: '', editedText: '', pasteText: BASE, textSource: 'paste', createdAt: now, updatedAt: now });
+    await db.put('pages', { id: 'mk1', bookId: 'b1', image: null, thumb: null, comment: '', tagIds: [], ocrStatus: 'none', ocrText: '', editedText: { ocr: '', paste: '' }, pasteText: BASE, textSource: 'paste', createdAt: now, updatedAt: now });
     const page = await db.get('pages', 'mk1');
     const a = await marksMod.addMark(page, BASE, at0, at0 + QUOTE.length);
     const second = BASE.indexOf('部屋の明るさ');
@@ -624,7 +625,7 @@ async function run() {
 
     // 前を手直しして「部屋の明るさ」を別の言葉にする
     const edited = '【一】' + BASE.replace('部屋の明るさ', '窓の色');
-    const r = await marksMod.updatePageText('mk1', { editedText: edited });
+    const r = await marksMod.updatePageText('mk1', { editedText: { ocr: '', paste: edited } });
     const ms = await marksMod.marksOfPage('mk1');
     const A = ms.find((m) => m.id === a.id);
     const B = ms.find((m) => m.id === b.id);
@@ -658,6 +659,46 @@ async function run() {
     assert((await share.readShare(id)) === null, '消えていない');
   });
 
+
+
+  await test('使う文章を切り替えても手直しは消えず、元に戻すと手直しも戻る。マーカーは切り替え先で探し直す', async () => {
+    const now = Date.now();
+    const ocrRaw = 'しおりを挟んだぺージには、その日の気持ちが残っている。';      // 読み取りの誤り（ぺ）
+    const ocrFixed = 'しおりを挟んだページには、その日の気持ちが残っている。';
+    const paste = '（レンズ）しおりを挟んだページには、その日の気持ちが残っている。あとで開くと思い出す。';
+    await db.put('pages', { id: 'sw1', bookId: 'b1', image: null, thumb: null, comment: '', tagIds: [], ocrStatus: 'done',
+      ocrText: ocrRaw, editedText: { ocr: ocrFixed, paste: '' }, pasteText: paste, textSource: 'ocr', createdAt: now, updatedAt: now });
+    let page = await db.get('pages', 'sw1');
+    assert(ocr.adoptedText(page).text === ocrFixed, '読み取り結果の手直しが出ていない');
+    const at = ocrFixed.indexOf(QUOTE);
+    const m = await marksMod.addMark(page, ocrFixed, at, at + QUOTE.length);
+
+    let r = await marksMod.updatePageText('sw1', { textSource: 'paste' });       // 貼り付けに切り替え
+    page = await db.get('pages', 'sw1');
+    assert(ocr.adoptedText(page).text === paste && editedOf(page, 'ocr') === ocrFixed, '切り替えたら手直しが消えた');
+    let mk = await db.get('marks', m.id);
+    assert(marksMod.isPlaced(mk, paste) && mk.start === paste.indexOf(QUOTE), `切り替え先で探し直していない ${JSON.stringify(r.moved)}`);
+
+    // 貼り付けの側も手直しする（読み取り結果の手直しは別に残る）
+    const pasteFixed = paste.replace('（レンズ）', '');
+    r = await marksMod.updatePageText('sw1', (cur) => ({ editedText: { ...cur.editedText, paste: pasteFixed } }));
+    page = await db.get('pages', 'sw1');
+    assert(editedOf(page, 'paste') === pasteFixed && editedOf(page, 'ocr') === ocrFixed, '手直しが混ざった');
+
+    r = await marksMod.updatePageText('sw1', { textSource: 'ocr' });             // 読み取り結果に戻す
+    page = await db.get('pages', 'sw1');
+    assert(ocr.adoptedText(page).text === ocrFixed, '戻したのに読み取り結果の手直しが戻らない');
+    mk = await db.get('marks', m.id);
+    assert(marksMod.isPlaced(mk, ocrFixed) && mk.start === at, 'マーカーが元の位置に戻らない');
+    await marksMod.updatePageText('sw1', { textSource: 'paste' });
+    assert(ocr.adoptedText(await db.get('pages', 'sw1')).text === pasteFixed, '貼り付けの手直しが戻らない');
+    return '読み取り結果の手直し・貼り付けの手直しとも、切り替えて戻すと戻る';
+  });
+
+  await test('試作段階の形（editedText が1つの文字列）でも、使っていた側の手直しとして読める', async () => {
+    const p = { textSource: 'paste', pasteText: '原文', ocrText: '読み取り', editedText: '直した文' };
+    assert(ocr.adoptedText(p).text === '直した文' && editedOf(p, 'ocr') === '', JSON.stringify(ocr.adoptedText(p)));
+  });
 
   // ---- バックアップ ----
   await test('バックアップ v2：書き出す → データを消す → 読み込むで、写真・全文・マーカー・設定が完全に戻る', async () => {

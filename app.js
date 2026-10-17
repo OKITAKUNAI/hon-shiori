@@ -9,6 +9,7 @@ import * as ocr from './ocr.js';
 import * as share from './share.js';
 import { renderText, makeZoomable } from './textview.js';
 import * as marksMod from './marks.js';
+import { editedOf, withEdited } from './text.js';
 import { exportBackup, importBackup, summarize } from './backup.js';
 
 const app = $('#app');
@@ -235,7 +236,7 @@ function newPage(bookId, fields = {}) {
   const now = fields.createdAt || Date.now();
   return {
     id: uid(), bookId, image: null, thumb: null, thumbVersion: THUMB_VERSION, comment: '', tagIds: [],
-    ocrStatus: 'none', ocrText: '', editedText: '', pasteText: '', textSource: null,
+    ocrStatus: 'none', ocrText: '', editedText: { ocr: '', paste: '' }, pasteText: '', textSource: null,
     writingMode: null, ocrLang: null, ocrPsm: null,
     createdAt: now, updatedAt: now,
     ...fields,
@@ -769,13 +770,16 @@ async function viewPage(id) {
   }
   for (const b of $$('[data-use]')) {
     b.onclick = async () => {
-      // 手で直した文章があると、切り替えても画面の文章は変わらないので、手直しを外してよいか確かめる
-      if (page.editedText && !(await confirmDialog({
+      // 手直しは元の文章ごとに残るので消えない。マーカーは切り替え先の文章で探し直すため、合わなくなる可能性を確かめる
+      const to = b.dataset.use;
+      const from = ocr.sourceOf(page);
+      if ((editedOf(page, from) || editedOf(page, to) || pageMarks.length) && !(await confirmDialog({
         title: '使う文章を切り替えますか？',
         ok: '切り替える',
-        body: '<p>このページには手で直した文章があります。切り替えると<b>手で直した文章は使われなくなり（消えます）</b>、切り替え先の原文を表示します。</p><p>マーカーは切り替え先の文章の中で位置を探し直します。見つからないものは「位置不明」になります。</p>',
+        body: `<p>${SOURCE_LABEL[to]}の文章${editedOf(page, to) ? '（手直しした文章）' : ''}を表示します。今の${SOURCE_LABEL[from]}の手直しは消えずに残り、元に戻せば手直しも戻ります。</p>
+          ${pageMarks.length ? '<p>マーカーは切り替え先の文章の中で位置を探し直します。<b>文章が違うと位置が合わなくなる</b>ことがあり、見つからないものは「位置不明」になります。</p>' : ''}`,
       }))) return;
-      const patch = { textSource: b.dataset.use, editedText: '', updatedAt: Date.now() };
+      const patch = { textSource: to, updatedAt: Date.now() };
       const r = await marksMod.updatePageText(id, patch);
       Object.assign(page, patch);
       if (r.moved?.lost) toast(`${r.moved.lost}件のマーカーの位置が分からなくなりました。付け直してください`);
@@ -881,7 +885,7 @@ async function viewPage(id) {
 
 // ---------- 文章の手直し ----------
 // 上半分に元の写真（指で拡大）、下半分に横書きの入力欄。入力が止まって600ミリ秒後に自動で保存する。
-// 手直しは editedText に保存し、原文（ocrText / pasteText）には触れない。原文と同じに戻したら editedText は空にする
+// 手直しは editedText に元の文章ごとに保存し、原文（ocrText / pasteText）には触れない。原文と同じに戻したら、その手直しは空にする
 
 async function viewEdit(id) {
   const page = await db.get('pages', id);
@@ -913,14 +917,14 @@ async function viewEdit(id) {
     el.textContent = msg;
   };
   const write = async (value) => {
-    const editedText = value === original ? '' : value;
-    const r = await marksMod.updatePageText(id, { editedText, updatedAt: Date.now() });
+    const edited = value === original ? '' : value;
+    const r = await marksMod.updatePageText(id, (cur) => ({ editedText: withEdited(cur, shown.source, edited), updatedAt: Date.now() }));
     await touchBook(page.bookId);
     const moved = r.moved || {};
     mark(moved.lost ? `保存しました（マーカー${moved.lost}件の位置が不明）` : '保存しました ✓');
     const state = $('#editState');
-    if (state) state.textContent = editedText ? '（手直しあり）' : '';
-    $('#resetEdit')?.toggleAttribute('hidden', !editedText);
+    if (state) state.textContent = edited ? '（手直しあり）' : '';
+    $('#resetEdit')?.toggleAttribute('hidden', !edited);
   };
   const saveLater = debounce(write, 600);
   let dirty = false;
