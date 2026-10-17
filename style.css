@@ -415,3 +415,15 @@ dialog.viewer .zoom-frame img { height: 100%; }
 .crop-handle::after { content: ''; position: absolute; inset: -12px; } /* 指で押しやすいよう当たり判定を広げる */
 .crop-actions { position: sticky; bottom: calc(70px + env(safe-area-inset-bottom)); background: var(--bg); padding: 8px 0; }
 .sub-h { margin: 16px 0 4px; font-size: 0.92rem; color: var(--accent-ink); }
+
+/* ---- 読み取りの自信が低い文字の印（薄い点線） ---- */
+.textview span.low { text-decoration: underline dotted rgba(214, 120, 30, 0.75); text-decoration-thickness: 2px; text-underline-offset: 0.18em; }
+.low-sample { text-decoration: underline dotted rgba(214, 120, 30, 0.85); text-decoration-thickness: 2px; }
+.ocr-time { margin-top: 2px; }
+.hl-wrap { position: relative; flex: 1; display: flex; min-height: 140px; }
+.hl-wrap #editText { position: relative; z-index: 1; background: transparent; flex: 1; }
+.hl-backdrop {
+  position: absolute; inset: 0; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal;
+  color: transparent; background: #fffdfa; border: solid transparent; border-radius: 12px; pointer-events: none;
+}
+.hl-backdrop mark { color: transparent; background: rgba(245, 170, 60, 0.28); border-bottom: 2px dotted rgba(214, 120, 30, 0.8); border-radius: 2px; }

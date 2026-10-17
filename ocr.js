@@ -125,19 +125,31 @@ let cancelCurrent = null;
 
 // 写真を前処理してから読み取る。
 // pre：前処理の指定（preprocess.js の options。省くとコントラスト調整だけ）。psm：ページ分割モードを指定（比較用）
+// 戻り値：{ text, low（信頼度が99未満の文字：[位置, 信頼度]）, lang, psm, pre, time（かかった時間 ms） }
 export async function recognize(blob, mode, { onProgress, psm, pre = {} } = {}) {
+  const t0 = performance.now();
   const w = await getWorker(mode, onProgress);
   if (psm && psm !== workerPsm) {
     await w.setParameters({ tessedit_pageseg_mode: psm });
     workerPsm = psm;
   }
+  const t1 = performance.now();
   try {
     const { blob: prepared, info } = await preprocessForOcr(blob, { ...pre, vertical: mode === 'vertical' });
+    const t2 = performance.now();
     const cancelled = new Promise((_, reject) => { cancelCurrent = () => reject(new CancelledError()); });
-    const job = w.recognize(prepared);
+    // blocks：文字ごとの信頼度を受け取る
+    const job = w.recognize(prepared, {}, { text: true, blocks: true });
     job.catch(() => {}); // キャンセルでワーカーを止めたとき、取り残された読み取りの失敗は無視する
     const { data } = await Promise.race([job, cancelled]);
-    return { text: cleanText(data.text || ''), lang: MODES[mode].lang, psm: workerPsm, pre: info };
+    const t3 = performance.now();
+    let text = cleanText(data.text || '');
+    const low = lowConfidence(text, symbolsOf(data));
+    if (mode === 'vertical') text = fixVerticalBars(text);
+    return {
+      text, low, lang: MODES[mode].lang, psm: workerPsm, pre: info,
+      time: { total: Math.round(t3 - t0), load: Math.round(t1 - t0), pre: Math.round(t2 - t1), ocr: Math.round(t3 - t2) },
+    };
   } finally {
     cancelCurrent = null;
     scheduleIdleStop();
@@ -145,6 +157,42 @@ export async function recognize(blob, mode, { onProgress, psm, pre = {} } = {}) 
 }
 
 // ---------- 結果の整形 ----------
+
+// 縦書きで読み取った縦棒「|」は、直前がカタカナなら長音「ー」、それ以外は漢数字の「一」に置き換える
+export function fixVerticalBars(text) {
+  // カタカナ：U+30A0〜U+30FF（長音「ー」を含む）と半角カタカナ U+FF66〜U+FF9F。
+  // 縦棒が続くとき（「ア||」）は、置き換えたあとの直前の文字（ー）を見るので「アーー」になる
+  let out = '';
+  for (const ch of text) {
+    out += ch === '|' || ch === '｜' ? (/[゠-ヿｦ-ﾟ]/.test(out.at(-1) || '') ? 'ー' : '一') : ch;
+  }
+  return out;
+}
+
+function symbolsOf(data) {
+  const out = [];
+  for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) for (const w of l.words || []) for (const s of w.symbols || []) out.push({ text: s.text, conf: s.confidence });
+  return out;
+}
+
+// 整形した文章の文字と、Tesseract の文字ごとの信頼度を対応づけ、信頼度が99未満の文字の位置を返す。
+// 整形は空白と改行を取り除くだけなので、空白以外の文字は Tesseract の文字と同じ順に並ぶ（念のため数文字先まで探して合わせる）
+export const LOW_CONF_KEEP = 99;
+export function lowConfidence(text, symbols) {
+  const low = [];
+  let k = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (/\s/.test(ch)) continue;
+    let found = -1;
+    for (let d = 0; d < 4 && k + d < symbols.length; d++) if ((symbols[k + d].text || '').startsWith(ch)) { found = k + d; break; }
+    if (found < 0) continue;
+    const c = symbols[found].conf;
+    if (c < LOW_CONF_KEEP) low.push([i, Math.round(c * 10) / 10]);
+    k = found + 1;
+  }
+  return low;
+}
 
 const CJK = '\\u3000-\\u30ff\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff\\uff01-\\uff60';
 const isCJK = (ch) => new RegExp(`[${CJK}]`).test(ch);
@@ -251,6 +299,8 @@ async function processQueue() {
           ocrLang: r.lang,
           ocrPsm: r.psm,
           ocrPre: r.pre,             // 使った前処理（切り抜き・傾きの角度・二値化・除いたルビの数）
+          ocrLow: r.low,             // 信頼度の低い文字 [ocrText の中の位置, 信頼度]
+          ocrTime: r.time,           // かかった時間（ms）：合計・エンジンの準備・前処理・認識
           ocrAt: Date.now(),
           ocrError: '',
           // どちらを使うか未選択なら、貼り付けた文章があればそちら、なければ読み取り結果

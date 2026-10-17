@@ -37,3 +37,47 @@ export function adoptedText(page) {
   const e = editedOf(page, source);
   return { source, edited: !!e, text: e || sourceText(page, source) };
 }
+
+// ---------- 信頼度の低い文字の印 ----------
+
+// 印を付ける基準（この値より信頼度が低い文字）。p9 の写真で、実際の誤り9か所のうち 96→6か所・97→7か所・98→8か所を拾い、
+// 正しい字への印は 96→4.0%・97→5.5%・98→7.4% だった（99 にすると 37.5% に増える）
+export const LOW_CONF_LEVELS = { 96: '少なめ（96）', 97: 'ふつう（97）', 98: '多め（98）' };
+export const LOW_CONF_DEFAULT = 98;
+
+// 2つの文章の文字を対応づける（最長共通部分列）。a の各位置に対応する b の位置（なければ -1）を返す。
+// 手直しはふつう一部分なので、前後の一致する部分を先に除いてから計算する
+export function alignMap(a, b) {
+  const map = new Int32Array(a.length).fill(-1);
+  let p = 0;
+  while (p < a.length && p < b.length && a[p] === b[p]) { map[p] = p; p++; }
+  let s = 0;
+  while (s < a.length - p && s < b.length - p && a[a.length - 1 - s] === b[b.length - 1 - s]) { map[a.length - 1 - s] = b.length - 1 - s; s++; }
+  const A = a.slice(p, a.length - s);
+  const B = b.slice(p, b.length - s);
+  if (!A.length || !B.length) return map;
+  if (A.length * B.length > 4e6) return map; // 長すぎるときは前後の一致だけで済ませる
+  const n = A.length;
+  const m = B.length;
+  const dp = new Uint16Array((n + 1) * (m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i * (m + 1) + j] = A[i] === B[j] ? dp[(i + 1) * (m + 1) + j + 1] + 1 : Math.max(dp[(i + 1) * (m + 1) + j], dp[i * (m + 1) + j + 1]);
+    }
+  }
+  for (let i = 0, j = 0; i < n && j < m;) {
+    if (A[i] === B[j]) { map[p + i] = p + j; i++; j++; } else if (dp[(i + 1) * (m + 1) + j] >= dp[i * (m + 1) + j + 1]) i++; else j++;
+  }
+  return map;
+}
+
+// 文章 text の中で、信頼度の低い文字の位置（Set）。読み取り結果（ocrText）から変わっていない文字だけに印を残す
+// （手直しした文字の印は消える）。貼り付けの文章を使っているときは印を出さない
+export function lowConfIn(page, text, threshold = LOW_CONF_DEFAULT) {
+  if (sourceOf(page) !== 'ocr' || !page.ocrLow?.length || !text) return new Set();
+  const raw = page.ocrText || '';
+  const lows = page.ocrLow.filter(([, c]) => c < threshold).map(([i]) => i);
+  if (text === raw) return new Set(lows);
+  const map = alignMap(raw, text);
+  return new Set(lows.map((i) => map[i]).filter((i) => i >= 0));
+}

@@ -9,7 +9,7 @@ import * as ocr from './ocr.js';
 import * as share from './share.js';
 import { renderText, makeZoomable } from './textview.js';
 import * as marksMod from './marks.js';
-import { editedOf, withEdited } from './text.js';
+import { editedOf, withEdited, lowConfIn, LOW_CONF_LEVELS, LOW_CONF_DEFAULT } from './text.js';
 import { exportBackup, importBackup, summarize } from './backup.js';
 import { suggestCrop } from './preprocess.js';
 
@@ -505,6 +505,10 @@ async function viewPage(id) {
   const shown = ocr.adoptedText(page);
   const vertical = (pageTextDir.get(id) || ocr.pageMode(page, book)) === 'vertical';
   let pageMarks = await marksMod.marksOfPage(id);
+  const lowLevel = Number(await db.getSetting('lowConfLevel', LOW_CONF_DEFAULT));
+  const showTime = await db.getSetting('showOcrTime', true);
+  const lowCount = lowConfIn(page, shown.text, lowLevel).size;
+  const t = page.ocrTime;
 
   // 変えた項目だけを書き込む（裏で作り直したサムネなどを古い値で上書きしないため）
   const save = async (patch) => {
@@ -540,7 +544,8 @@ async function viewPage(id) {
       ${shown.text ? '<p class="tiny muted sel-hint">線を引くには、始まりの文字をタップしてから終わりの文字をタップします</p>' : ''}
       <div class="textview" id="textView"></div>
       <div id="lostMarks"></div>
-      ${shown.text ? `<p class="tiny muted text-meta">元の文章：${SOURCE_LABEL[shown.source]}${shown.edited ? '（手直しあり）' : ''}</p>` : ''}
+      ${shown.text ? `<p class="tiny muted text-meta">元の文章：${SOURCE_LABEL[shown.source]}${shown.edited ? '（手直しあり）' : ''}${lowCount ? `・<span class="low-sample">点線</span>は読み取りの自信が低い文字（${lowCount}字）` : ''}</p>` : ''}
+      ${showTime && t && page.image ? `<p class="tiny muted ocr-time">読み取りにかかった時間：<b>${(t.total / 1000).toFixed(1)}秒</b>（エンジンの準備 ${(t.load / 1000).toFixed(1)}秒・前処理 ${(t.pre / 1000).toFixed(1)}秒・認識 ${(t.ocr / 1000).toFixed(1)}秒）${page.ocrPsm ? `・PSM ${page.ocrPsm}` : ''}</p>` : ''}
       <details class="sources" ${pageTextTab.has(id) ? 'open' : ''}>
         <summary>読み取り結果と貼り付け（原文）</summary>
       ${page.image ? `<div class="row text-tools">
@@ -605,7 +610,7 @@ async function viewPage(id) {
     const text = currentText();
     const placed = pageMarks.filter((m) => marksMod.isPlaced(m, text))
       .map((m) => ({ id: m.id, start: m.start, end: m.end, color: marksMod.colorHex(m.color) }));
-    renderText($('#textView'), text, { vertical: isVertical(), marks: placed, selection: sel.range, anchor: sel.anchor });
+    renderText($('#textView'), text, { vertical: isVertical(), marks: placed, selection: sel.range, anchor: sel.anchor, low: lowConfIn(page, text, lowLevel) });
     drawLost(text);
     drawSelBar();
   };
@@ -994,12 +999,34 @@ async function viewEdit(id) {
         <span class="small muted grow">元の文章：${SOURCE_LABEL[shown.source]} <span id="editState">${shown.edited ? '（手直しあり）' : ''}</span></span>
         <button type="button" class="btn ghost small" id="resetEdit" ${shown.edited ? '' : 'hidden'}>手直しを取り消す</button>
       </div>
-      <textarea id="editText" spellcheck="false">${esc(shown.text)}</textarea>
+      <div class="hl-wrap">
+        <div class="hl-backdrop" id="editBackdrop" aria-hidden="true"></div>
+        <textarea id="editText" spellcheck="false">${esc(shown.text)}</textarea>
+      </div>
     </div>`;
 
   if (page.image) makeZoomable($('#editPhoto'), $('#editPhoto img'));
 
   const ta = $('#editText');
+  // 信頼度の低い文字の印：入力欄には色を付けられないので、同じ文字の並びを後ろの層に描き、印の部分だけ色を付ける。
+  // 手直しした文字の印は消える（読み取り結果から変わっていない文字にだけ残す）
+  const lowLevel = Number(await db.getSetting('lowConfLevel', LOW_CONF_DEFAULT));
+  const backdrop = $('#editBackdrop');
+  const cs = getComputedStyle(ta);
+  for (const k of ['fontFamily', 'fontSize', 'lineHeight', 'letterSpacing', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth']) backdrop.style[k] = cs[k];
+  const drawLow = () => {
+    // 入力欄にスクロールバーが出ると折り返しの幅が変わるので、そのぶん右の余白を広げてそろえる
+    const scrollbar = ta.offsetWidth - ta.clientWidth - parseFloat(cs.borderLeftWidth) - parseFloat(cs.borderRightWidth);
+    backdrop.style.paddingRight = `${parseFloat(cs.paddingRight) + Math.max(0, scrollbar)}px`;
+    const low = lowConfIn(page, ta.value, lowLevel);
+    let html = '';
+    for (let i = 0; i < ta.value.length; i++) html += low.has(i) ? `<mark>${esc(ta.value[i])}</mark>` : esc(ta.value[i]);
+    backdrop.innerHTML = html + '\n ';
+    backdrop.scrollTop = ta.scrollTop;
+  };
+  drawLow();
+  ta.addEventListener('scroll', () => { backdrop.scrollTop = ta.scrollTop; });
+  const drawLowLater = debounce(drawLow, 120);
   const mark = (msg) => {
     const el = $('#editSaved');
     if (!el) return;
@@ -1017,7 +1044,7 @@ async function viewEdit(id) {
   };
   const saveLater = debounce(write, 600);
   let dirty = false;
-  ta.oninput = () => { dirty = true; mark('…'); saveLater(ta.value); };
+  ta.oninput = () => { dirty = true; mark('…'); saveLater(ta.value); drawLowLater(); };
   // 画面を離れるときに、まだ保存していない入力を書き込む
   onLeave(() => { if (dirty) { saveLater.cancel?.(); write(ta.value); } });
 
@@ -1030,6 +1057,7 @@ async function viewEdit(id) {
     ta.value = original;
     dirty = false;
     await write(original);
+    drawLow();
   };
 }
 
@@ -1158,6 +1186,8 @@ async function viewSettings() {
   const psmVertical = String(await db.getSetting('ocrPsmVertical', '5'));
   const pre = await ocr.preSettings();
   const cropAfterShot = await db.getSetting('cropAfterShot', true);
+  const lowLevel = String(await db.getSetting('lowConfLevel', LOW_CONF_DEFAULT));
+  const showTime = await db.getSetting('showOcrTime', true);
 
   app.innerHTML = `
     <header class="hero small-hero"><h1>設定</h1></header>
@@ -1174,6 +1204,10 @@ async function viewSettings() {
       <label class="toggle"><input type="checkbox" id="ocrAuto" ${ocrAuto ? 'checked' : ''}> 写真を追加したら、自動で読み取る</label>
       <label class="field"><span class="label">縦書きのページの読み方</span>
         <select id="ocrPsm">${Object.entries(ocr.PSM_OPTIONS).map(([v, l]) => `<option value="${v}" ${v === psmVertical ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+      <label class="field"><span class="label">読み取りの自信が低い文字の印（点線）</span>
+        <select id="lowConf">${Object.entries(LOW_CONF_LEVELS).map(([v, l]) => `<option value="${v}" ${v === lowLevel ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+      <p class="muted tiny">多めにすると見落としが減り、正しい字にも印が付きやすくなります（p9 の写真では、誤り9か所のうち 少なめ6・ふつう7・多め8 か所に印が付き、正しい字への印は 4.0%・5.5%・7.4% でした）。</p>
+      <label class="toggle"><input type="checkbox" id="showOcrTime" ${showTime ? 'checked' : ''}> 読み取りにかかった時間をページに表示する</label>
       <h4 class="sub-h">読み取りの前処理</h4>
       <label class="toggle"><input type="checkbox" id="cropAfterShot" ${cropAfterShot ? 'checked' : ''}> 1枚撮ったら、読み取る範囲の画面を出す</label>
       <label class="toggle"><input type="checkbox" data-pre="autoCrop" ${pre.autoCrop ? 'checked' : ''}> 範囲を指定していないページは、本文の範囲を自動で推定する（柱・ページ番号・ページの外を除く）</label>
@@ -1206,6 +1240,8 @@ async function viewSettings() {
   for (const el of $$('[data-pre]')) el.onchange = () => savePre({ [el.dataset.pre]: el.checked });
   $('#ocrBinarize').onchange = (e) => savePre({ binarize: e.target.value });
   $('#cropAfterShot').onchange = (e) => db.setSetting('cropAfterShot', e.target.checked);
+  $('#lowConf').onchange = (e) => db.setSetting('lowConfLevel', Number(e.target.value));
+  $('#showOcrTime').onchange = (e) => db.setSetting('showOcrTime', e.target.checked);
 
   $('#exportBtn').onclick = async () => {
     toast('書き出しています…');

@@ -15,7 +15,8 @@ const alpha = (c) => `color-mix(in srgb, ${c} 55%, transparent)`;
 
 // marks: [{ id, start, end, color }]（位置不明のものは渡さない）
 // selection: { start, end } 確定前の選択範囲 / anchor: 最初にタップした文字の位置
-export function renderText(el, text, { vertical = true, marks = [], selection = null, anchor = null } = {}) {
+// low: 信頼度の低い文字の位置（Set）。薄い印を付ける
+export function renderText(el, text, { vertical = true, marks = [], selection = null, anchor = null, low = null } = {}) {
   el.classList.toggle('vertical', vertical);
   el.classList.toggle('horizontal', !vertical);
   if (!text) {
@@ -50,6 +51,7 @@ export function renderText(el, text, { vertical = true, marks = [], selection = 
     if (ms.length) cls.push('mk');
     if (i >= selA && i < selB) cls.push('sel');
     if (i === anchorChar) cls.push('anchor');
+    if (low?.has(at)) cls.push('low');
     const style = paint(ms.map((m) => m.color), vertical);
     html += `<span data-i="${at}"${ms.length ? ` data-marks="${ms.map((m) => m.id).join(' ')}"` : ''}${cls.length ? ` class="${cls.join(' ')}"` : ''}${style ? ` style="${style}"` : ''}>${esc(ch)}</span>`;
   });

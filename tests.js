@@ -11,7 +11,7 @@ import { makeAnchor, reanchor, isPlaced } from './anchor.js';
 import * as marksMod from './marks.js';
 import { renderText } from './textview.js';
 import { exportBackup, importBackup } from './backup.js';
-import { editedOf } from './text.js';
+import { editedOf, lowConfIn, alignMap } from './text.js';
 
 const TEST_DB = 'hon-shiori-test';
 const list = document.getElementById('results');
@@ -735,6 +735,53 @@ async function run() {
     const all = rows.filter((r) => r.name === '1〜4');
     assert(all.every((r) => r.score >= 0.9 && r.leak === 0), JSON.stringify(rows));
     return rows.map((r) => `${r.name}・PSM${r.psm}：${Math.round(r.score * 100)}%（ルビの混入 ${r.leak}）`).join(' ／ ');
+  });
+
+
+  // ---- 読み取りの自信が低い文字の印・縦棒の置き換え・かかった時間 ----
+  await test('縦書きの縦棒「|」は、直前がカタカナなら「ー」、それ以外は「一」にする', async () => {
+    const cases = [['ス|パ|', 'スーパー'], ['第|章', '第一章'], ['|つの道', '一つの道'], ['ア||', 'アーー'], ['ｶ|ﾄﾞ', 'ｶーﾄﾞ'], ['、|投', '、一投'], ['全角｜も', '全角一も']];
+    for (const [a, b] of cases) assert(ocr.fixVerticalBars(a) === b, `${a} → ${ocr.fixVerticalBars(a)}（期待 ${b}）`);
+    return cases.map(([a, b]) => `${a}→${b}`).join('　');
+  });
+
+  await test('Tesseract の文字ごとの信頼度を、整形した文章の位置に対応づける（空白・改行は飛ばす）', async () => {
+    const text = 'しおりを\n挟んだ AB';
+    const syms = [...'しおりを挟んだAB'].map((ch, i) => ({ text: ch, conf: [99, 99, 62, 99, 99, 97.3, 99, 50, 99][i] }));
+    const low = ocr.lowConfidence(text, syms);
+    assert(JSON.stringify(low) === JSON.stringify([[2, 62], [6, 97.3], [9, 50]]), JSON.stringify(low));
+  });
+
+  await test('手直しした文字の印は消え、ほかの文字の印は位置をずらして残る', async () => {
+    const page = { textSource: 'ocr', ocrText: 'すべての入間の生活は一つの道', ocrLow: [[4, 81], [10, 97.5], [12, 99]], editedText: { ocr: '', paste: '' } };
+    assert([...lowConfIn(page, page.ocrText, 98)].join(',') === '4,10', '手直し前');
+    assert([...lowConfIn(page, page.ocrText, 97)].join(',') === '4', '基準97');
+    const fixed = '【序】すべての人間の生活は一つの道'; // 入→人 を直し、前に3文字足した
+    assert([...lowConfIn(page, fixed, 98)].join(',') === '13', `手直し後 ${[...lowConfIn(page, fixed, 98)]}`);
+    assert(lowConfIn({ ...page, textSource: 'paste', pasteText: 'x' }, 'x', 98).size === 0, '貼り付けの文章に印が出た');
+    const m = alignMap('abcdef', 'abXdef');
+    assert(m[2] === -1 && m[3] === 3 && m[0] === 0, JSON.stringify([...m]));
+  });
+
+  await test('文章の表示で、信頼度の低い文字に印のクラスが付く', async () => {
+    const el = document.createElement('div');
+    renderText(el, 'すべての入間', { vertical: true, low: new Set([4]) });
+    assert(el.querySelector('span[data-i="4"]').classList.contains('low') && el.querySelectorAll('span.low').length === 1, el.innerHTML);
+  });
+
+  await test('裏で読み取ったページに、信頼度の低い文字とかかった時間が保存される', async () => {
+    const image = await toBlob(drawPage(1200, 1600));
+    const now = Date.now();
+    await db.put('pages', { id: 'cf1', bookId: 'b1', image, thumb: image, comment: '', tagIds: [], ocrStatus: 'none', ocrText: '', editedText: { ocr: '', paste: '' }, pasteText: '', textSource: null, createdAt: now + 200, updatedAt: now });
+    const done = new Promise((res) => { const off = ocr.onOcrChange((p) => { if (p.id === 'cf1' && (p.ocrStatus === 'done' || p.ocrStatus === 'failed')) { off(); res(); } }); });
+    await ocr.enqueue('cf1');
+    await done;
+    const p = await db.get('pages', 'cf1');
+    assert(Array.isArray(p.ocrLow) && p.ocrLow.every(([i, c]) => Number.isInteger(i) && i < p.ocrText.length && c < 99), `ocrLow ${JSON.stringify(p.ocrLow)?.slice(0, 80)}`);
+    const tm = p.ocrTime;
+    assert(tm && tm.total > 0 && tm.total >= tm.pre + tm.ocr && tm.ocr > 0, `ocrTime ${JSON.stringify(tm)}`);
+    assert(!/[|｜]/.test(p.ocrText), '縦棒が残っている');
+    return `かかった時間 ${(tm.total / 1000).toFixed(1)}秒（準備 ${tm.load}ms・前処理 ${tm.pre}ms・認識 ${tm.ocr}ms）・信頼度の低い文字 ${p.ocrLow.length}字`;
   });
 
   // ---- 共有の受け取り ----
