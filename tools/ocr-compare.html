@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>保存サイズと読み方の比較</title>
+  <title>前処理・保存サイズ・読み方の比較</title>
   <link rel="stylesheet" href="../style.css">
   <style>
     body { padding: 16px; max-width: 980px; margin: 0 auto; }
@@ -17,12 +17,13 @@
     details { background: #fff; border-radius: 12px; padding: 8px 12px; margin: 6px 0; }
     details pre { white-space: pre-wrap; font-size: 0.8rem; max-height: 240px; overflow: auto; }
     .vt { writing-mode: vertical-rl; height: 220px; overflow-x: auto; font-size: 0.85rem; line-height: 1.8; }
-    .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin: 6px 0; }
+    .pre-img { max-width: 100%; max-height: 70vh; display: block; margin: 6px auto; border: 1px solid var(--line); }
   </style>
 </head>
 <body>
-  <h1>保存サイズと読み方（PSM）の比較</h1>
-  <p class="small">写真を、アプリと同じ方法で 1568 / 2400 / 3200px に縮小して保存したときの容量と、それぞれを PSM 5（縦書きの1つのかたまり）と PSM 3（自動判定）で読み取った結果を比べます。読み取りはアプリと同じ前処理（グレースケール化・コントラスト調整）を通します。</p>
+  <h1>前処理・保存サイズ・読み方（PSM）の比較</h1>
+  <p class="small">写真を、アプリと同じ方法で 1568 / 2400 / 3200px に縮小して保存したときの容量と、それぞれを前処理の組み合わせ（なし／1〜3／1〜4）と PSM 5（縦書きの1つのかたまり）・PSM 3（自動判定）で読み取った結果を比べます。前処理の1〜4は、1. 本文の自動切り抜き　2. 傾き補正　3. 二値化　4. ルビの除去 です。「前処理なし」でもグレースケール化とコントラスト調整は行います。</p>
   <p class="small">写真は <code>private/</code> フォルダ（Git の管理外）に置くと自動で読み込みます。同じ名前の <code>.txt</code>（例：<code>p1.jpg</code> なら <code>p1.txt</code>）に正しい文章を書いておくと一致率を計算します。処理はすべてこのパソコンの中で行い、どこにも送信しません。</p>
 
   <div class="controls">
@@ -33,6 +34,7 @@
     <button class="btn ghost small" id="sample">見本（canvas）で試す</button>
     <button class="btn ghost small" id="copy" disabled>表をコピー（数字だけ）</button>
   </div>
+  <div class="controls" id="choices"></div>
   <p class="small" id="files">写真：まだありません</p>
   <p id="log"></p>
 

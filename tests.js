@@ -5,6 +5,8 @@ import { makeThumb, regenerateThumbs } from './thumbs.js';
 import * as ocr from './ocr.js';
 import * as share from './share.js';
 import { preprocessForOcr } from './preprocess.js';
+import * as P from './preprocess.js';
+import { drawRubyPage, RUBY_TRUTH, RUBY_STRINGS } from './tools/sample-page.js';
 import { makeAnchor, reanchor, isPlaced } from './anchor.js';
 import * as marksMod from './marks.js';
 import { renderText } from './textview.js';
@@ -642,6 +644,95 @@ async function run() {
     await marksMod.deleteMark(a.id);
     assert((await marksMod.marksOfPage('mk1')).length === 1, '削除できていない');
     return `付け直しの結果: ${JSON.stringify(r.moved)}`;
+  });
+
+
+  // ---- 前処理（切り抜き・傾き補正・二値化・ルビの除去）。見本は canvas で描いたルビ付きの縦書きのページ ----
+  const grayOf = (canvas) => P.toGray(canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data, canvas.width, canvas.height);
+  const hard = drawRubyPage({ skew: 1.5, shadow: true, outside: true });
+  const HW = hard.canvas.width;
+  const HH = hard.canvas.height;
+
+  await test('前処理1：本文の範囲を自動で推定し、柱・ページ番号・ページの外を外す', async () => {
+    const small = P.downscale(grayOf(hard.canvas), HW, HH, 800);
+    const b = P.estimateTextBox(P.binarizeSauvola(small.g, small.w, small.h), small.w, small.h, true);
+    const box = { x0: b.x0 / small.s, y0: b.y0 / small.s, x1: b.x1 / small.s, y1: b.y1 / small.s };
+    const tol = hard.s * 0.6; // 傾き1.5度のぶんのずれを許す
+    assert(box.y0 > hard.headerBottom, `柱が入っている（上端 ${Math.round(box.y0)} / 柱の下端 ${Math.round(hard.headerBottom)}）`);
+    assert(box.x0 > hard.pageLeft, `ページの外が入っている（左端 ${Math.round(box.x0)} / ページの端 ${hard.pageLeft}）`);
+    assert(box.x0 <= hard.body.x0 + tol && box.x1 >= hard.body.x1 - tol && box.y0 <= hard.body.y0 + tol && box.y1 >= hard.body.y1 - tol,
+      `本文が欠けている 推定 ${[box.x0, box.y0, box.x1, box.y1].map(Math.round)} / 本文 ${[hard.body.x0, hard.body.y0, hard.body.x1, hard.body.y1].map(Math.round)}`);
+    return `推定 ${[box.x0, box.y0, box.x1, box.y1].map(Math.round).join(',')}・本文 ${[hard.body.x0, hard.body.y0, hard.body.x1, hard.body.y1].map(Math.round).join(',')}`;
+  });
+
+  await test('前処理2：傾き（1.5度）を推定して補正すると、行がほぼ垂直になる', async () => {
+    const res = P.runPipeline(grayOf(hard.canvas), HW, HH, { crop: 'auto', deskew: true, vertical: true });
+    const sm = P.downscale(res.g, res.w, res.h, 900);
+    const after = P.estimateSkew(P.binarizeSauvola(sm.g, sm.w, sm.h), sm.w, sm.h, true);
+    assert(Math.abs(res.info.angle) >= 1 && Math.abs(res.info.angle) <= 2, `推定した角度 ${res.info.angle}`);
+    assert(Math.abs(after) <= 0.3, `補正後に残った傾き ${after}`);
+    return `推定 ${res.info.angle}度 → 補正後に残った傾き ${after}度`;
+  });
+
+  await test('前処理3：影のある紙の部分を、Sauvola法は文字と間違えない（大津の方法と比べる）', async () => {
+    const g = grayOf(hard.canvas);
+    P.normalizeContrast(g);
+    // 左下の影の中の、文字のない紙の部分
+    const area = { x0: hard.pageLeft + 60, y0: Math.round(HH * 0.7), x1: Math.round(hard.body.x0 - 80), y1: HH - 60 };
+    const ratio = (ink) => { let n = 0; let k = 0; for (let y = area.y0; y < area.y1; y++) for (let x = area.x0; x < area.x1; x++) { n++; k += ink[y * HW + x]; } return k / n; };
+    const sauvola = ratio(P.binarizeSauvola(g, HW, HH));
+    const otsu = ratio(P.binarizeOtsu(g));
+    assert(sauvola < 0.01, `Sauvola でも ${(sauvola * 100).toFixed(1)}% が黒`);
+    return `影の中の紙が黒になった割合：Sauvola ${(sauvola * 100).toFixed(2)}% ／ 大津 ${(otsu * 100).toFixed(1)}%`;
+  });
+
+  await test('前処理4：ルビの帯だけを消し、本文（小さい「っ」「ゃ」や句読点を含む）の画素は1つも消さない', async () => {
+    const flat = drawRubyPage({ header: false });
+    const W = flat.canvas.width;
+    const H = flat.canvas.height;
+    const g = grayOf(flat.canvas);
+    const ink = P.binarizeSauvola(g, W, H);
+    const before = ink.slice();
+    const r = P.removeRuby(ink, W, H, true);
+    const count = (arr, rect) => { let k = 0; for (let y = Math.max(0, Math.floor(rect.y0)); y < Math.min(H, Math.ceil(rect.y1)); y++) for (let x = Math.max(0, Math.floor(rect.x0)); x < Math.min(W, Math.ceil(rect.x1)); x++) k += arr[y * W + x]; return k; };
+    let rubyBefore = 0; let rubyAfter = 0;
+    for (const rr of flat.ruby) { rubyBefore += count(before, rr); rubyAfter += count(ink, rr); }
+    // 本文の文字の枠（句読点は枠の右上にはみ出すので、そのぶん広げて数える）
+    let bodyBefore = 0; let bodyAfter = 0; let smallBefore = 0; let smallAfter = 0;
+    for (const c of flat.cells) {
+      const rect = { x0: c.x0 - 2, y0: c.y0 - flat.s * 0.45, x1: c.x1 + 2, y1: c.y1 };
+      const b0 = count(before, rect); const b1 = count(ink, rect);
+      bodyBefore += b0; bodyAfter += b1;
+      if ('っゃゅょ、。'.includes(c.ch)) { smallBefore += b0; smallAfter += b1; }
+    }
+    assert(r.removed.length >= flat.ruby.length / 2, `消した帯 ${r.removed.length}`);
+    assert(rubyAfter / rubyBefore < 0.05, `ルビが ${Math.round((rubyAfter / rubyBefore) * 100)}% 残っている`);
+    assert(bodyAfter === bodyBefore && smallAfter === smallBefore, `本文の画素が消えた（${bodyBefore} → ${bodyAfter}、小さい文字と句読点 ${smallBefore} → ${smallAfter}）`);
+    return `行の幅 ${r.lineWidth}px・消した帯 ${r.removed.length}本・ルビの画素 ${rubyBefore} → ${rubyAfter}・本文の画素 ${bodyBefore} → ${bodyAfter}（小さい文字と句読点 ${smallBefore} → ${smallAfter}）`;
+  });
+
+  await test('四隅で囲んだ範囲を長方形に引き伸ばす（射影変換）', async () => {
+    const W = 400; const H = 300;
+    const g = new Uint8ClampedArray(W * H).fill(255);
+    for (let y = 100; y < 200; y++) for (let x = 100; x < 300; x++) g[y * W + x] = 0; // 真ん中の黒い長方形
+    const out = P.warpQuad(g, W, H, [[100, 100], [300, 100], [300, 200], [100, 200]]);
+    let black = 0;
+    for (let i = 0; i < out.g.length; i++) black += out.g[i] < 128 ? 1 : 0;
+    assert(out.w === 200 && out.h === 100 && black / out.g.length > 0.95, `大きさ ${out.w}×${out.h}・黒 ${Math.round((black / out.g.length) * 100)}%`);
+  });
+
+  await test('前処理の効果：傾き・影・柱・ページの外・ルビのある見本で、前処理なしと1〜4を比べる', async () => {
+    const blob = await toBlob(hard.canvas, 'image/jpeg', 0.9);
+    const rows = [];
+    for (const [name, pre] of [['なし', {}], ['1〜3', { crop: 'auto', deskew: true, binarize: 'sauvola' }], ['1〜4', { crop: 'auto', deskew: true, binarize: 'sauvola', removeRuby: true }]]) {
+      for (const psm of ['5', '3']) {
+        const r = await ocr.recognize(blob, 'vertical', { psm, pre });
+        rows.push({ name, psm, score: similarity(r.text, RUBY_TRUTH), leak: RUBY_STRINGS.filter((x) => r.text.includes(x)).length });
+      }
+    }
+    const all = rows.filter((r) => r.name === '1〜4');
+    assert(all.every((r) => r.score >= 0.9 && r.leak === 0), JSON.stringify(rows));
+    return rows.map((r) => `${r.name}・PSM${r.psm}：${Math.round(r.score * 100)}%（ルビの混入 ${r.leak}）`).join(' ／ ');
   });
 
   // ---- 共有の受け取り ----

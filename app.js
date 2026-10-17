@@ -11,6 +11,7 @@ import { renderText, makeZoomable } from './textview.js';
 import * as marksMod from './marks.js';
 import { editedOf, withEdited } from './text.js';
 import { exportBackup, importBackup, summarize } from './backup.js';
+import { suggestCrop } from './preprocess.js';
 
 const app = $('#app');
 
@@ -210,7 +211,7 @@ async function touchBook(bookId) {
 }
 
 // 写真をページとして保存する。保存が済んだら利用者はすぐ次へ進め、文字認識は裏で順番に行う
-async function addPagesFromFiles(bookId, files, { pasteText = '' } = {}) {
+async function addPagesFromFiles(bookId, files, { pasteText = '', deferOcr = false } = {}) {
   const book = await db.get('books', bookId);
   const auto = await db.getSetting('ocrAuto', true);
   const base = Date.now();
@@ -227,7 +228,7 @@ async function addPagesFromFiles(bookId, files, { pasteText = '' } = {}) {
     }
   }
   await touchBook(bookId);
-  if (auto && ids.length) startAutoOcr(ids, ocr.pageMode({}, book)); // 待たずに戻る
+  if (auto && ids.length && !deferOcr) startAutoOcr(ids, ocr.pageMode({}, book)); // 待たずに戻る
   return ids;
 }
 
@@ -422,8 +423,10 @@ async function viewBook(id) {
     e.target.value = '';
     if (!files.length) return;
     toast(`${files.length}枚を保存しています…`);
-    const ids = await addPagesFromFiles(id, files);
-    if (files.length === 1 && ids[0]) go('#/page/' + ids[0]);
+    // 1枚のときは、読み取り範囲の画面を挟む（自動で推定した範囲が初期値。「この範囲で読み取る」で始まる）
+    const cropFirst = files.length === 1 && (await db.getSetting('cropAfterShot', true));
+    const ids = await addPagesFromFiles(id, files, { deferOcr: cropFirst });
+    if (cropFirst && ids[0]) { cropFromCapture = ids[0]; go(`#/page/${ids[0]}/crop`); } else if (files.length === 1 && ids[0]) go('#/page/' + ids[0]);
     else { toast(`${ids.length}枚追加しました`); render(true); }
   };
   $('#cameraInput').onchange = onFiles;
@@ -551,6 +554,7 @@ async function viewPage(id) {
         ${status === 'queued' || status === 'running'
           ? '<button class="btn ghost small" id="ocrCancel">読み取りをやめる</button>'
           : `<button class="btn soft small" id="ocrRun">🔍 ${page.ocrText ? 'もう一度読み取る' : '文字を読み取る'}</button>`}
+        <a class="btn ghost small" href="#/page/${id}/crop">✂️ 読み取り範囲${page.ocrCrop ? '（指定あり）' : ''}</a>
       </div>` : ''}
       <div class="seg" role="tablist">
         <button type="button" role="tab" data-tab="ocr" class="${textTab === 'ocr' ? 'on' : ''}">読み取り結果${adopted === 'ocr' ? '<i>使用中</i>' : ''}</button>
@@ -883,6 +887,91 @@ async function viewPage(id) {
   };
 }
 
+// ---------- 読み取り範囲（四隅の指定） ----------
+// 写真そのものは切り抜かず、四隅の位置（0〜1 の割合）を ocrCrop に記録する。読み取るたびにその範囲を長方形に引き伸ばして使う
+
+let cropFromCapture = null; // 撮影の直後に開いたページ（決めずに離れても、自動の範囲で読み取りを始める）
+const FULL_QUAD = [[0, 0], [1, 0], [1, 1], [0, 1]];
+
+async function viewCrop(id) {
+  const page = await db.get('pages', id);
+  if (!page?.image) return go('#/page/' + id);
+  const book = await db.get('books', page.bookId);
+  const mode = ocr.pageMode(page, book);
+  const fromCapture = cropFromCapture === id;
+  cropFromCapture = null;
+  let decided = false;
+
+  app.innerHTML = `
+    <div class="topbar">
+      <a href="#/page/${id}" class="back">‹ ${fromCapture ? 'あとで（自動の範囲で読む）' : 'ページに戻る'}</a>
+    </div>
+    <h2 class="crop-title">読み取る範囲</h2>
+    <p class="small muted">本文だけを囲むように、四隅の ● を動かしてください。柱・ページ番号・ページの外を外すと、読み取りの精度が上がります。</p>
+    <div class="crop-stage" id="cropStage">
+      <img id="cropImg" src="${blobUrl(page.image)}" alt="ページの写真" draggable="false">
+      <svg class="crop-svg" viewBox="0 0 1 1" preserveAspectRatio="none"><polygon id="cropPoly" vector-effect="non-scaling-stroke"></polygon></svg>
+      ${[0, 1, 2, 3].map((i) => `<span class="crop-handle" data-h="${i}"></span>`).join('')}
+    </div>
+    <p class="tiny muted" id="cropNote">本文の範囲を推定しています…</p>
+    <div class="row">
+      <button type="button" class="btn ghost small" id="cropAuto">自動で囲む</button>
+      <button type="button" class="btn ghost small" id="cropFull">写真全体</button>
+    </div>
+    <div class="row-end crop-actions">
+      ${page.ocrCrop ? '<button type="button" class="btn ghost" id="cropClear">指定をやめる</button>' : ''}
+      <button type="button" class="btn primary" id="cropGo">この範囲で読み取る</button>
+    </div>`;
+
+  const stage = $('#cropStage');
+  let quad = page.ocrCrop ? page.ocrCrop.map((p) => [...p]) : null;
+  const draw = () => {
+    if (!quad) return;
+    $('#cropPoly').setAttribute('points', quad.map(([x, y]) => `${x},${y}`).join(' '));
+    $$('.crop-handle').forEach((el, i) => { el.style.left = `${quad[i][0] * 100}%`; el.style.top = `${quad[i][1] * 100}%`; });
+  };
+  const autoQuad = async () => {
+    $('#cropNote').textContent = '本文の範囲を推定しています…';
+    quad = await suggestCrop(page.image, mode === 'vertical');
+    $('#cropNote').textContent = '自動で推定した範囲です。ずれていたら ● を動かしてください。';
+    draw();
+  };
+  if (quad) { $('#cropNote').textContent = '前に指定した範囲です。'; draw(); } else autoQuad();
+
+  // ● をドラッグして動かす
+  let drag = -1;
+  stage.addEventListener('pointerdown', (e) => {
+    const h = e.target.closest('.crop-handle');
+    if (!h) return;
+    drag = Number(h.dataset.h);
+    stage.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  stage.addEventListener('pointermove', (e) => {
+    if (drag < 0 || !quad) return;
+    const r = $('#cropImg').getBoundingClientRect();
+    quad[drag] = [Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))];
+    draw();
+  });
+  const endDrag = () => { drag = -1; };
+  stage.addEventListener('pointerup', endDrag);
+  stage.addEventListener('pointercancel', endDrag);
+
+  $('#cropAuto').onclick = autoQuad;
+  $('#cropFull').onclick = () => { quad = FULL_QUAD.map((p) => [...p]); $('#cropNote').textContent = '写真全体を読み取ります。'; draw(); };
+
+  const start = async (ocrCrop) => {
+    decided = true;
+    await db.update('pages', id, { ocrCrop, updatedAt: Date.now() });
+    go('#/page/' + id);
+    await startAutoOcr([id], mode); // 「この範囲で読み取る」を押したので、自動で読む設定にかかわらず始める
+  };
+  $('#cropGo').onclick = () => quad && start(quad.map(([x, y]) => [+x.toFixed(4), +y.toFixed(4)]));
+  $('#cropClear')?.addEventListener('click', () => start(null));
+  // 撮影の直後に決めずに離れたときは、自動の範囲で読み取りを始める
+  onLeave(() => { if (fromCapture && !decided) db.getSetting('ocrAuto', true).then((a) => a && startAutoOcr([id], mode)); });
+}
+
 // ---------- 文章の手直し ----------
 // 上半分に元の写真（指で拡大）、下半分に横書きの入力欄。入力が止まって600ミリ秒後に自動で保存する。
 // 手直しは editedText に元の文章ごとに保存し、原文（ocrText / pasteText）には触れない。原文と同じに戻したら、その手直しは空にする
@@ -1067,6 +1156,8 @@ async function viewSettings() {
   const ready = await ocr.readiness();
   const ocrAuto = await db.getSetting('ocrAuto', true);
   const psmVertical = String(await db.getSetting('ocrPsmVertical', '5'));
+  const pre = await ocr.preSettings();
+  const cropAfterShot = await db.getSetting('cropAfterShot', true);
 
   app.innerHTML = `
     <header class="hero small-hero"><h1>設定</h1></header>
@@ -1083,6 +1174,17 @@ async function viewSettings() {
       <label class="toggle"><input type="checkbox" id="ocrAuto" ${ocrAuto ? 'checked' : ''}> 写真を追加したら、自動で読み取る</label>
       <label class="field"><span class="label">縦書きのページの読み方</span>
         <select id="ocrPsm">${Object.entries(ocr.PSM_OPTIONS).map(([v, l]) => `<option value="${v}" ${v === psmVertical ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+      <h4 class="sub-h">読み取りの前処理</h4>
+      <label class="toggle"><input type="checkbox" id="cropAfterShot" ${cropAfterShot ? 'checked' : ''}> 1枚撮ったら、読み取る範囲の画面を出す</label>
+      <label class="toggle"><input type="checkbox" data-pre="autoCrop" ${pre.autoCrop ? 'checked' : ''}> 範囲を指定していないページは、本文の範囲を自動で推定する（柱・ページ番号・ページの外を除く）</label>
+      <label class="toggle"><input type="checkbox" data-pre="deskew" ${pre.deskew ? 'checked' : ''}> 傾きを自動で補正する</label>
+      <label class="toggle"><input type="checkbox" data-pre="removeRuby" ${pre.removeRuby ? 'checked' : ''}> ルビ・傍点を取り除いてから読む</label>
+      <label class="field"><span class="label">白黒にする方法（二値化）</span>
+        <select id="ocrBinarize">
+          <option value="sauvola" ${pre.binarize === 'sauvola' ? 'selected' : ''}>場所ごとに判断する（Sauvola法・影や明るさのむらに強い）</option>
+          <option value="otsu" ${pre.binarize === 'otsu' ? 'selected' : ''}>全体で1つの基準（大津の方法）</option>
+          <option value="none" ${pre.binarize === 'none' ? 'selected' : ''}>白黒にしない</option>
+        </select></label>
     </section>
 
     <section class="card">
@@ -1100,6 +1202,10 @@ async function viewSettings() {
   for (const b of $$('[data-dl]')) b.onclick = async () => { if (await ensureOcrReady(b.dataset.dl)) render(true); };
   $('#ocrAuto').onchange = (e) => db.setSetting('ocrAuto', e.target.checked);
   $('#ocrPsm').onchange = async (e) => { await db.setSetting('ocrPsmVertical', e.target.value); toast('次の読み取りから使います'); };
+  const savePre = async (patch) => { await db.setSetting('ocrPre', { ...(await db.getSetting('ocrPre', {})), ...patch }); toast('次の読み取りから使います'); };
+  for (const el of $$('[data-pre]')) el.onchange = () => savePre({ [el.dataset.pre]: el.checked });
+  $('#ocrBinarize').onchange = (e) => savePre({ binarize: e.target.value });
+  $('#cropAfterShot').onchange = (e) => db.setSetting('cropAfterShot', e.target.checked);
 
   $('#exportBtn').onclick = async () => {
     toast('書き出しています…');
@@ -1248,6 +1354,7 @@ const routes = [
   [/^#\/book\/(\w+)$/, viewBook, 'shelf'],
   [/^#\/page\/(\w+)$/, viewPage, 'shelf'],
   [/^#\/page\/(\w+)\/edit$/, viewEdit, 'shelf'],
+  [/^#\/page\/(\w+)\/crop$/, viewCrop, 'shelf'],
   [/^#\/tags$/, viewTags, 'tags'],
   [/^#\/tag\/(\w+)$/, viewTag, 'tags'],
   [/^#\/settings$/, viewSettings, 'settings'],

@@ -35,6 +35,18 @@ export const STATUS_LABEL = {
 
 export const pageMode = (page, book) => page.writingMode || book?.writingMode || 'vertical';
 
+// 前処理の設定（設定画面で変えられる）。既定はすべて使う
+export const PRE_DEFAULTS = { autoCrop: true, deskew: true, binarize: 'sauvola', removeRuby: true };
+export async function preSettings() {
+  return { ...PRE_DEFAULTS, ...(await db.getSetting('ocrPre', {})) };
+}
+
+// ページの読み取りに使う前処理：四隅の指定（ocrCrop）があればそれ、なければ設定に応じて自動推定
+export async function preFor(page) {
+  const s = await preSettings();
+  return { crop: page.ocrCrop || (s.autoCrop ? 'auto' : null), deskew: s.deskew, binarize: s.binarize, removeRuby: s.removeRuby };
+}
+
 export async function psmFor(mode) {
   return mode === 'vertical' ? String(await db.getSetting('ocrPsmVertical', '5')) : '3';
 }
@@ -111,20 +123,21 @@ class CancelledError extends Error {
 }
 let cancelCurrent = null;
 
-// 写真を前処理してから読み取る。{ psm } を渡すとその設定で読む（test.html の比較用）
-export async function recognize(blob, mode, { onProgress, psm } = {}) {
+// 写真を前処理してから読み取る。
+// pre：前処理の指定（preprocess.js の options。省くとコントラスト調整だけ）。psm：ページ分割モードを指定（比較用）
+export async function recognize(blob, mode, { onProgress, psm, pre = {} } = {}) {
   const w = await getWorker(mode, onProgress);
   if (psm && psm !== workerPsm) {
     await w.setParameters({ tessedit_pageseg_mode: psm });
     workerPsm = psm;
   }
   try {
-    const { blob: prepared } = await preprocessForOcr(blob);
+    const { blob: prepared, info } = await preprocessForOcr(blob, { ...pre, vertical: mode === 'vertical' });
     const cancelled = new Promise((_, reject) => { cancelCurrent = () => reject(new CancelledError()); });
     const job = w.recognize(prepared);
     job.catch(() => {}); // キャンセルでワーカーを止めたとき、取り残された読み取りの失敗は無視する
     const { data } = await Promise.race([job, cancelled]);
-    return { text: cleanText(data.text || ''), lang: MODES[mode].lang, psm: workerPsm };
+    return { text: cleanText(data.text || ''), lang: MODES[mode].lang, psm: workerPsm, pre: info };
   } finally {
     cancelCurrent = null;
     scheduleIdleStop();
@@ -227,7 +240,7 @@ async function processQueue() {
         progressListeners.forEach((fn) => fn(next.id, currentProgress.value));
       };
       try {
-        const r = await recognize(next.image, mode, { onProgress });
+        const r = await recognize(next.image, mode, { onProgress, pre: await preFor(next) });
         // 読み取り中に取り消されていたら結果は使わない
         const now = await db.get('pages', next.id);
         if (now?.ocrStatus !== 'running') continue;
@@ -237,6 +250,7 @@ async function processQueue() {
           ocrText: r.text,           // 認識結果の原文。手で直した文章（editedText）には触れない
           ocrLang: r.lang,
           ocrPsm: r.psm,
+          ocrPre: r.pre,             // 使った前処理（切り抜き・傾きの角度・二値化・除いたルビの数）
           ocrAt: Date.now(),
           ocrError: '',
           // どちらを使うか未選択なら、貼り付けた文章があればそちら、なければ読み取り結果
