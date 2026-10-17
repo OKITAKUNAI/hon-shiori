@@ -107,6 +107,11 @@ export async function setSetting(key, value) {
   return put('settings', { key, value });
 }
 
+export async function getByIndex(name, index, value) {
+  const s = await store(name);
+  return wrap(s.index(index).getAll(value));
+}
+
 export async function pagesOfBook(bookId) {
   const s = await store('pages');
   const pages = await wrap(s.index('bookId').getAll(bookId));

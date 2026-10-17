@@ -5,6 +5,9 @@ import { makeThumb, regenerateThumbs } from './thumbs.js';
 import * as ocr from './ocr.js';
 import * as share from './share.js';
 import { preprocessForOcr } from './preprocess.js';
+import { makeAnchor, reanchor, isPlaced } from './anchor.js';
+import * as marksMod from './marks.js';
+import { renderText } from './textview.js';
 
 const TEST_DB = 'hon-shiori-test';
 const list = document.getElementById('results');
@@ -507,6 +510,136 @@ async function run() {
     p = await db.get('pages', 'c1');
     assert(p.ocrStatus === 'done' && p.ocrText.length > 10, `再実行の状態 ${p.ocrStatus} ${p.ocrError || ''}`);
     return `キャンセルにかかった時間 ${cancelMs}ms`;
+  });
+
+
+  // ---- 範囲選択とマーカーの追従 ----
+  const BASE = 'しおりを挟んだページには、その日の気持ちが残っている。あとで開くと、読んだときの部屋の明るさまで思い出す。';
+  const QUOTE = 'その日の気持ちが残っている。';
+  const at0 = BASE.indexOf(QUOTE);
+  const m0 = { id: 'x', ...makeAnchor(BASE, at0, at0 + QUOTE.length) };
+  const follow = (newText, mark = m0, oldText = BASE) => {
+    const r = reanchor(mark, oldText, newText);
+    return { ...r, ok: isPlaced(r.mark, newText) && r.mark.quote === mark.quote };
+  };
+
+  await test('マーカー追従：範囲より前に文字を追加しても、同じ一文を指す', async () => {
+    const t = '【第一章】' + BASE;
+    const r = follow(t);
+    assert(r.ok && r.how === 'shifted' && r.mark.start === at0 + 5, JSON.stringify(r));
+    return `${at0} → ${r.mark.start}（差分でずらした）`;
+  });
+
+  await test('マーカー追従：範囲より前の文字を削除しても、同じ一文を指す', async () => {
+    const t = BASE.replace('しおりを挟んだ', '');
+    const r = follow(t);
+    assert(r.ok && r.how === 'shifted' && r.mark.start === at0 - 7, JSON.stringify(r));
+  });
+
+  await test('マーカー追従：範囲より前を長さの違う文字に置き換えても、同じ一文を指す', async () => {
+    const t = BASE.replace('ページ', '頁');
+    const r = follow(t);
+    assert(r.ok && r.how === 'shifted' && r.mark.start === at0 - 2, JSON.stringify(r));
+  });
+
+  await test('マーカー追従：範囲より後ろを直しても、位置は変わらない', async () => {
+    const t = BASE.replace('部屋の明るさ', 'へやの明るさ');
+    const r = follow(t);
+    assert(r.ok && r.how === 'kept' && r.mark.start === at0, JSON.stringify(r));
+  });
+
+  await test('マーカー追従：同じ一文が2回出てくるとき、印を付けたほう（2回目）を指し続ける', async () => {
+    const t2 = BASE + QUOTE + 'それでも本を閉じた。';
+    const second = t2.lastIndexOf(QUOTE);
+    const mark = { id: 'y', ...makeAnchor(t2, second, second + QUOTE.length) };
+    // 1回目より前を直す → 差分でずらす
+    const a = reanchor(mark, t2, '　' + t2);
+    assert(isPlaced(a.mark, '　' + t2) && a.mark.start === second + 1, `前を直したとき ${a.mark.start}`);
+    // 1回目を消す → ずらした位置で一致するので2回目のまま
+    const t3 = t2.replace(QUOTE, '');
+    const b = reanchor(mark, t2, t3);
+    assert(isPlaced(b.mark, t3) && b.mark.start === t3.lastIndexOf(QUOTE), `1回目を消したとき ${b.mark.start}`);
+    // 全文を貼り直して差分が使えないとき（前と後ろの両方が変わった）→ 前後の文字で2回目を選ぶ
+    const t4 = 'まえがき。' + t2 + '（了）';
+    const c = reanchor(mark, t2, t4);
+    assert(c.how === 'found' && c.mark.start === t4.lastIndexOf(QUOTE), `貼り直したとき ${c.how} ${c.mark.start} / 2回目 ${t4.lastIndexOf(QUOTE)}`);
+    return `前を直す→${a.how}、1回目を消す→${b.how}、貼り直し→${c.how}`;
+  });
+
+  await test('マーカー追従：全文を貼り直しても（一部の文字が違っても）、同じ一文を探し直す', async () => {
+    const t = 'しおりをはさんだ頁には、' + QUOTE + 'あとでひらくと、読んだ時の部屋のあかるさまで思いだす。';
+    const r = follow(t);
+    assert(r.ok && r.how === 'found' && r.mark.start === t.indexOf(QUOTE), JSON.stringify(r));
+  });
+
+  await test('マーカー追従：選んだ文字列が文章からなくなったら「位置不明」として残す（消さない）', async () => {
+    const t = BASE.replace(QUOTE, 'その日の心が、まだここにある。');
+    const r = follow(t);
+    assert(r.how === 'lost' && !isPlaced(r.mark, t) && r.mark.quote === QUOTE, JSON.stringify(r));
+  });
+
+  await test('マーカー追従：範囲の中の誤字を直したときは、直した後の文字列で範囲を保つ', async () => {
+    const ocrish = BASE.replace('気持ち', '気持ぢ');
+    const at = ocrish.indexOf('その日');
+    const mark = { id: 'z', ...makeAnchor(ocrish, at, at + QUOTE.length) };
+    const r = reanchor(mark, ocrish, BASE);
+    assert(r.how === 'edited' && isPlaced(r.mark, BASE) && r.mark.quote === QUOTE, JSON.stringify(r));
+  });
+
+  await test('縦書き／横書きを切り替えても、文字の位置（範囲とマーカー）は同じ', async () => {
+    const t = '𠮷野家の𩸽。' + QUOTE; // UTF-16 で2単位の文字を含む
+    const el = document.createElement('div');
+    const mk = [{ id: 'm', start: t.indexOf(QUOTE), end: t.indexOf(QUOTE) + 4, color: '#f6a5b9' }];
+    renderText(el, t, { vertical: true, marks: mk, selection: { start: 0, end: 2 } });
+    const v = [...el.querySelectorAll('span[data-i]')].map((x) => `${x.dataset.i}:${x.textContent}:${x.className}`);
+    renderText(el, t, { vertical: false, marks: mk, selection: { start: 0, end: 2 } });
+    const h = [...el.querySelectorAll('span[data-i]')].map((x) => `${x.dataset.i}:${x.textContent}:${x.className}`);
+    assert(JSON.stringify(v) === JSON.stringify(h), '縦と横で位置が違う');
+    assert(v[0] === '0:𠮷:sel' && v[1].startsWith('2:野'), `先頭: ${v.slice(0, 2)}`);
+    assert(el.querySelectorAll('span.mk').length === 4, 'マーカーの文字数が違う');
+  });
+
+  await test('マーカーが重なっても、それぞれの色が見える', async () => {
+    const el = document.createElement('div');
+    renderText(el, BASE, { vertical: true, marks: [
+      { id: 'a', start: 0, end: 10, color: '#f6a5b9' },
+      { id: 'b', start: 5, end: 15, color: '#a9c8f2' },
+    ] });
+    const both = el.querySelector('span[data-i="6"]');
+    assert(both.dataset.marks === 'a b' && /linear-gradient/.test(both.getAttribute('style')), both.outerHTML);
+  });
+
+  await test('マーカーを保存し、文章を手直しすると付け直され、消した一文は位置不明になる（保存形式はフェーズ5の完成形）', async () => {
+    const now = Date.now();
+    await db.put('pages', { id: 'mk1', bookId: 'b1', image: null, thumb: null, comment: '', tagIds: [], ocrStatus: 'none', ocrText: '', editedText: '', pasteText: BASE, textSource: 'paste', createdAt: now, updatedAt: now });
+    const page = await db.get('pages', 'mk1');
+    const a = await marksMod.addMark(page, BASE, at0, at0 + QUOTE.length);
+    const second = BASE.indexOf('部屋の明るさ');
+    const b = await marksMod.addMark(page, BASE, second, second + 6);
+    const keys = Object.keys(a).sort().join(',');
+    assert(keys === 'bookId,color,comment,createdAt,end,id,pageId,prefix,quote,start,suffix,tagIds,updatedAt', keys);
+    assert(a.color === marksMod.DEFAULT_COLOR && a.tagIds.length === 0 && a.comment === '', '既定値が違う');
+    assert((await db.getByIndex('marks', 'pageId', 'mk1')).length === 2, 'pageId の索引で引けない');
+
+    // 前を手直しして「部屋の明るさ」を別の言葉にする
+    const edited = '【一】' + BASE.replace('部屋の明るさ', '窓の色');
+    const r = await marksMod.updatePageText('mk1', { editedText: edited });
+    const ms = await marksMod.marksOfPage('mk1');
+    const A = ms.find((m) => m.id === a.id);
+    const B = ms.find((m) => m.id === b.id);
+    assert(isPlaced(A, edited) && A.start === at0 + 3, `一文目 ${A.start}`);
+    assert(!isPlaced(B, edited) && B.quote === '部屋の明るさ', '消した一文が位置不明になっていない');
+    // 1回の保存で前と後ろの2か所を直したので、差分は両方をまたぐ。一文目は探し直しで見つかる
+    assert(r.moved.shifted + r.moved.found === 1 && r.moved.lost === 1, JSON.stringify(r.moved));
+
+    // 付け直し（色・タグ・コメントは保つ）と削除
+    const at = edited.indexOf('窓の色');
+    await marksMod.reattachMark(B, edited, at, at + 3);
+    const B2 = await db.get('marks', b.id);
+    assert(isPlaced(B2, edited) && B2.quote === '窓の色' && B2.color === b.color, '付け直せていない');
+    await marksMod.deleteMark(a.id);
+    assert((await marksMod.marksOfPage('mk1')).length === 1, '削除できていない');
+    return `付け直しの結果: ${JSON.stringify(r.moved)}`;
   });
 
   // ---- 共有の受け取り ----

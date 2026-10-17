@@ -5,6 +5,8 @@
 import * as db from './db.js';
 import { APP_ID } from './config.js';
 import { preprocessForOcr } from './preprocess.js';
+import { updatePageText } from './marks.js';
+export { sourceOf, sourceText, adoptedText } from './text.js';
 
 // フォルダ名にバージョンを入れている。sw.js は vendor/ を「中身が変わらないもの」として長くキャッシュするので、
 // 更新するときは新しいフォルダ名にすること
@@ -229,7 +231,8 @@ async function processQueue() {
         // 読み取り中に取り消されていたら結果は使わない
         const now = await db.get('pages', next.id);
         if (now?.ocrStatus !== 'running') continue;
-        emit(await db.update('pages', next.id, (cur) => ({
+        // 画面に出す文章が変わればマーカーを付け直す（手で直した文章があれば、画面の文章は変わらない）
+        emit((await updatePageText(next.id, (cur) => ({
           ocrStatus: 'done',
           ocrText: r.text,           // 認識結果の原文。手で直した文章（editedText）には触れない
           ocrLang: r.lang,
@@ -238,7 +241,7 @@ async function processQueue() {
           ocrError: '',
           // どちらを使うか未選択なら、貼り付けた文章があればそちら、なければ読み取り結果
           textSource: cur.textSource || (cur.pasteText?.trim() ? 'paste' : 'ocr'),
-        })));
+        }))).page);
       } catch (e) {
         if (e?.name === 'CancelledError') continue;
         console.error('OCR に失敗しました', e);
@@ -251,22 +254,4 @@ async function processQueue() {
   } finally {
     processing = false;
   }
-}
-
-// ---------- 採用中の文章 ----------
-
-// textSource は 'ocr' か 'paste'。未選択なら、貼り付けがあれば貼り付け、なければ読み取り結果
-export function sourceOf(page) {
-  return page.textSource || (page.pasteText?.trim() ? 'paste' : 'ocr');
-}
-
-export function sourceText(page, src = sourceOf(page)) {
-  return (src === 'paste' ? page.pasteText : page.ocrText) || '';
-}
-
-// 画面に出す文章：手で直した文章（editedText）があればそれ、なければ textSource が指す原文
-export function adoptedText(page) {
-  const source = sourceOf(page);
-  const edited = !!page.editedText;
-  return { source, edited, text: edited ? page.editedText : sourceText(page, source) };
 }

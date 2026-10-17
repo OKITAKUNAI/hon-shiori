@@ -8,6 +8,7 @@ import { makeThumb, regenerateThumbs } from './thumbs.js';
 import * as ocr from './ocr.js';
 import * as share from './share.js';
 import { renderText, makeZoomable } from './textview.js';
+import * as marksMod from './marks.js';
 
 const app = $('#app');
 
@@ -260,6 +261,19 @@ async function startAutoOcr(ids, mode) {
 
 const OCR_BADGE = { queued: '⏳', running: '🔍', failed: '⚠️' };
 
+// 写真のないページのカードに出す代表の一文（いちばん先に引いた、位置の分かるマーカー）
+async function marksByPage() {
+  const by = {};
+  for (const m of await db.getAll('marks')) (by[m.pageId] ??= []).push(m);
+  return by;
+}
+function cardQuote(p, byPage) {
+  if (p.thumb) return undefined;
+  const text = ocr.adoptedText(p).text;
+  const m = (byPage[p.id] || []).filter((x) => marksMod.isPlaced(x, text)).sort((a, b) => a.createdAt - b.createdAt)[0];
+  return m ? { text: m.quote, color: marksMod.colorHex(m.color) } : undefined;
+}
+
 // ページのカード。quote（マーカーした一文）を渡すと「ことば」表示（D案）になる：
 // 一文を縦書きで大きく出し、マーカー色をアクセントに、写真は背景に薄く敷く
 // 写真のないページは、マーカーがあれば代表の一文、なければ採用中の文章の冒頭を縦書きで出す（背景は紙の色）
@@ -365,7 +379,7 @@ async function createBook(v) {
 async function viewBook(id) {
   const book = await db.get('books', id);
   if (!book) return go('#/');
-  const [pages, tags] = await Promise.all([db.pagesOfBook(id), db.getAll('tags')]);
+  const [pages, tags, byPage] = await Promise.all([db.pagesOfBook(id), db.getAll('tags'), marksByPage()]);
   const tagsById = Object.fromEntries(tags.map((t) => [t.id, t]));
 
   app.innerHTML = `
@@ -397,7 +411,7 @@ async function viewBook(id) {
     ${pages.length ? `
       <p class="muted small hint-line">★がついたページが本棚の表紙になります</p>
       <div class="pages">
-        ${pages.map((p) => pageCard(p, { tagsById, isFav: p.id === book.favoritePageId })).join('')}
+        ${pages.map((p) => pageCard(p, { tagsById, isFav: p.id === book.favoritePageId, quote: cardQuote(p, byPage) })).join('')}
       </div>` : `
       <div class="empty small-empty"><p>好きなページを撮って、ここに集めましょう</p></div>`}`;
 
@@ -438,7 +452,7 @@ async function viewBook(id) {
     if (!v) return;
     if (v.__danger) {
       if (!confirm(`『${book.title}』と、保存した${pages.length}ページをすべて削除します。よろしいですか？`)) return;
-      for (const p of pages) await db.del('pages', p.id);
+      for (const p of pages) { await marksMod.deleteMarksOfPage(p.id); await db.del('pages', p.id); }
       await db.del('books', id);
       toast('削除しました');
       return go('#/');
@@ -485,6 +499,7 @@ async function viewPage(id) {
   const textTab = pageTextTab.get(id) || adopted || 'ocr';
   const shown = ocr.adoptedText(page);
   const vertical = (pageTextDir.get(id) || ocr.pageMode(page, book)) === 'vertical';
+  let pageMarks = await marksMod.marksOfPage(id);
 
   // 変えた項目だけを書き込む（裏で作り直したサムネなどを古い値で上書きしないため）
   const save = async (patch) => {
@@ -517,7 +532,9 @@ async function viewPage(id) {
         ${page.image ? '<button type="button" class="btn ghost small" id="zoomPhoto">📷 写真</button>' : ''}
         <a class="btn soft small ${shown.text ? '' : 'disabled'}" href="#/page/${id}/edit">✏️ 直す</a>
       </div>
+      ${shown.text ? '<p class="tiny muted sel-hint">線を引くには、始まりの文字をタップしてから終わりの文字をタップします</p>' : ''}
       <div class="textview" id="textView"></div>
+      <div id="lostMarks"></div>
       ${shown.text ? `<p class="tiny muted text-meta">元の文章：${SOURCE_LABEL[shown.source]}${shown.edited ? '（手直しあり）' : ''}</p>` : ''}
       <details class="sources" ${pageTextTab.has(id) ? 'open' : ''}>
         <summary>読み取り結果と貼り付け（原文）</summary>
@@ -566,13 +583,154 @@ async function viewPage(id) {
       </div>
     </section>
 
-    <div class="row center"><button class="btn ghost danger small" id="delPage">このページを削除</button></div>`;
+    <div class="row center"><button class="btn ghost danger small" id="delPage">このページを削除</button></div>
+    <div class="sel-bar" id="selBar" hidden></div>`;
 
   $('#photo')?.addEventListener('click', () => showImage(page.image));
   $('#zoomPhoto')?.addEventListener('click', () => showImage(page.image));
 
-  // --- 文章の表示（縦書き／横書き） ---
-  const drawText = () => renderText($('#textView'), ocr.adoptedText(page).text, { vertical: pageTextDir.get(id) ? pageTextDir.get(id) === 'vertical' : vertical });
+  // --- 文章の表示（縦書き／横書き）と範囲選択 ---
+  // 選択の状態：anchor = 最初にタップした文字の位置、range = 確定前の範囲、reattach = 付け直し中のマーカー
+  const sel = { anchor: null, anchorLen: 1, range: null, reattach: null };
+  const isVertical = () => (pageTextDir.get(id) ? pageTextDir.get(id) === 'vertical' : vertical);
+  const currentText = () => ocr.adoptedText(page).text;
+  const reloadMarks = async () => { pageMarks = await marksMod.marksOfPage(id); };
+  const drawText = () => {
+    const text = currentText();
+    const placed = pageMarks.filter((m) => marksMod.isPlaced(m, text))
+      .map((m) => ({ id: m.id, start: m.start, end: m.end, color: marksMod.colorHex(m.color) }));
+    renderText($('#textView'), text, { vertical: isVertical(), marks: placed, selection: sel.range, anchor: sel.anchor });
+    drawLost(text);
+    drawSelBar();
+  };
+
+  // 位置が分からなくなったマーカー：警告と、付け直し・削除のボタン（黙って消さない）
+  const drawLost = (text) => {
+    const lost = pageMarks.filter((m) => !marksMod.isPlaced(m, text));
+    $('#lostMarks').innerHTML = lost.length ? `
+      <div class="lost-box">
+        <p class="small"><b>⚠️ 位置が分からなくなったマーカーが ${lost.length} 件あります</b><br>
+        文章が変わったため、元の場所を見つけられませんでした。付け直すか、いらなければ削除してください。</p>
+        <ul>${lost.map((m) => `
+          <li><span class="dot" style="background:${marksMod.colorHex(m.color)}"></span><span class="grow">「${esc(m.quote.slice(0, 40))}${m.quote.length > 40 ? '…' : ''}」</span>
+            <button type="button" class="btn soft small" data-reattach="${m.id}">付け直す</button>
+            <button type="button" class="btn ghost small danger" data-delmark="${m.id}">削除</button></li>`).join('')}</ul>
+      </div>` : '';
+    for (const b of $$('[data-reattach]')) {
+      b.onclick = () => {
+        sel.reattach = pageMarks.find((m) => m.id === b.dataset.reattach);
+        sel.anchor = null; sel.range = null;
+        drawText();
+        $('#textView').scrollIntoView({ behavior: 'smooth', block: 'center' });
+      };
+    }
+    for (const b of $$('[data-delmark]')) b.onclick = () => removeMark(b.dataset.delmark);
+  };
+
+  const clearSel = () => { sel.anchor = null; sel.range = null; sel.reattach = null; drawText(); };
+
+  const drawSelBar = () => {
+    const bar = $('#selBar');
+    if (!bar) return;
+    const text = currentText();
+    let html = '';
+    if (sel.range) {
+      const q = text.slice(sel.range.start, sel.range.end);
+      html = `<span class="sel-quote">「${esc(q.slice(0, 24))}${q.length > 24 ? '…' : ''}」</span>
+        <button type="button" class="btn ghost small" data-sel="cancel">やめる</button>
+        <button type="button" class="btn primary small" data-sel="${sel.reattach ? 'reattach' : 'mark'}">${sel.reattach ? 'ここに付け直す' : '🖍 マーカーを引く'}</button>`;
+    } else if (sel.anchor != null) {
+      html = `<span class="sel-quote">終わりの文字をタップしてください</span><button type="button" class="btn ghost small" data-sel="cancel">やめる</button>`;
+    } else if (sel.reattach) {
+      html = `<span class="sel-quote">付け直す範囲の、始まりの文字をタップしてください</span><button type="button" class="btn ghost small" data-sel="cancel">やめる</button>`;
+    }
+    bar.innerHTML = html;
+    bar.hidden = !html;
+    bar.querySelector('[data-sel="cancel"]')?.addEventListener('click', clearSel);
+    bar.querySelector('[data-sel="mark"]')?.addEventListener('click', async () => {
+      await marksMod.addMark(page, currentText(), sel.range.start, sel.range.end);
+      await reloadMarks();
+      toast('マーカーを引きました');
+      clearSel();
+    });
+    bar.querySelector('[data-sel="reattach"]')?.addEventListener('click', async () => {
+      await marksMod.reattachMark(sel.reattach, currentText(), sel.range.start, sel.range.end);
+      await reloadMarks();
+      toast('マーカーを付け直しました');
+      clearSel();
+    });
+  };
+
+  const removeMark = async (markId) => {
+    const m = pageMarks.find((x) => x.id === markId);
+    if (!m || !(await confirmDialog({ title: 'マーカーを消しますか？', ok: '消す', body: `<p>「${esc(m.quote.slice(0, 60))}」のマーカーを消します。</p>` }))) return;
+    await marksMod.deleteMark(markId);
+    await reloadMarks();
+    toast('マーカーを消しました');
+    drawText();
+  };
+
+  // マーカーのある文字をタップしたとき：消すか、そこから範囲を選ぶか
+  const openMarkMenu = (ids, at, len) => {
+    const ms = pageMarks.filter((m) => ids.includes(m.id));
+    const dlg = document.createElement('dialog');
+    dlg.className = 'sheet';
+    dlg.innerHTML = `
+      <h3>マーカー</h3>
+      <ul class="mark-menu">${ms.map((m) => `
+        <li><span class="dot" style="background:${marksMod.colorHex(m.color)}"></span><span class="grow small">「${esc(m.quote.slice(0, 50))}${m.quote.length > 50 ? '…' : ''}」</span>
+          <button type="button" class="btn ghost small danger" data-del="${m.id}">消す</button></li>`).join('')}</ul>
+      <div class="row-end">
+        <button type="button" class="btn ghost" data-close>閉じる</button>
+        <button type="button" class="btn soft" data-start>ここから範囲を選ぶ</button>
+      </div>`;
+    document.body.append(dlg);
+    const close = () => { dlg.close(); dlg.remove(); };
+    dlg.querySelector('[data-close]').onclick = close;
+    dlg.addEventListener('cancel', close);
+    dlg.querySelector('[data-start]').onclick = () => { close(); sel.anchor = at; sel.anchorLen = len; drawText(); };
+    for (const b of dlg.querySelectorAll('[data-del]')) b.onclick = () => { close(); removeMark(b.dataset.del); };
+    dlg.showModal();
+  };
+
+  // 「始まりの文字をタップ → 終わりの文字をタップ」で範囲を決める
+  $('#textView').addEventListener('click', (e) => {
+    if (window.getSelection && !window.getSelection().isCollapsed) return; // PCのドラッグ選択は下で扱う
+    const el = e.target.closest('span[data-i]');
+    if (!el) return;
+    const at = Number(el.dataset.i);
+    const len = el.textContent.length;
+    if (sel.range) sel.range = null;
+    if (sel.anchor == null) {
+      if (el.dataset.marks && !sel.reattach) return openMarkMenu(el.dataset.marks.split(' '), at, len);
+      sel.anchor = at;
+      sel.anchorLen = len;
+    } else {
+      const start = Math.min(sel.anchor, at);
+      const end = Math.max(sel.anchor + sel.anchorLen, at + len);
+      sel.range = { start, end };
+      sel.anchor = null;
+    }
+    drawText();
+  });
+
+  // PCではドラッグで範囲を選べる
+  $('#textView').addEventListener('mouseup', () => {
+    const s = window.getSelection();
+    if (!s || s.isCollapsed) return;
+    const a = s.anchorNode?.parentElement?.closest?.('span[data-i]');
+    const b = s.focusNode?.parentElement?.closest?.('span[data-i]');
+    if (!a || !b || !$('#textView').contains(a) || !$('#textView').contains(b)) return;
+    const ia = Number(a.dataset.i);
+    const ib = Number(b.dataset.i);
+    const start = Math.min(ia, ib);
+    const end = Math.max(ia + a.textContent.length, ib + b.textContent.length);
+    s.removeAllRanges();
+    sel.anchor = null;
+    sel.range = { start, end };
+    drawText();
+  });
+
   drawText();
   for (const b of $$('[data-dir]')) {
     b.onclick = () => {
@@ -591,8 +749,13 @@ async function viewPage(id) {
   };
   const savePasteText = debounce(async (v) => {
     // 貼り付けた文章があり、まだどちらも選んでいなければ貼り付けを使う
-    await save({ pasteText: v, ...(page.textSource ? {} : { textSource: v.trim() ? 'paste' : null }) });
+    const patch = { pasteText: v, ...(page.textSource ? {} : { textSource: v.trim() ? 'paste' : null }), updatedAt: Date.now() };
+    const r = await marksMod.updatePageText(id, patch);
+    Object.assign(page, patch);
+    await reloadMarks();
+    drawText();
     textSavedMark();
+    if (r.moved?.lost) toast(`${r.moved.lost}件のマーカーの位置が分からなくなりました`);
   }, 600);
   $('#pasteText').oninput = (e) => savePasteText(e.target.value);
 
@@ -611,8 +774,11 @@ async function viewPage(id) {
         ok: '切り替える',
         body: '<p>このページには手で直した文章があります。切り替えると<b>手で直した文章は使われなくなり（消えます）</b>、切り替え先の原文を表示します。</p><p>マーカーは切り替え先の文章の中で位置を探し直します。見つからないものは「位置不明」になります。</p>',
       }))) return;
-      await save({ textSource: b.dataset.use, editedText: '' });
-      toast(b.dataset.use === 'ocr' ? '読み取り結果を使います' : '貼り付けた文章を使います');
+      const patch = { textSource: b.dataset.use, editedText: '', updatedAt: Date.now() };
+      const r = await marksMod.updatePageText(id, patch);
+      Object.assign(page, patch);
+      if (r.moved?.lost) toast(`${r.moved.lost}件のマーカーの位置が分からなくなりました。付け直してください`);
+      if (!r.moved?.lost) toast(b.dataset.use === 'ocr' ? '読み取り結果を使います' : '貼り付けた文章を使います');
       render(true);
     };
   }
@@ -703,7 +869,8 @@ async function viewPage(id) {
   };
 
   $('#delPage').onclick = async () => {
-    if (!confirm('このページを削除しますか？（写真とメモも消えます）')) return;
+    if (!confirm('このページを削除しますか？（写真・文章・メモ・マーカーも消えます）')) return;
+    await marksMod.deleteMarksOfPage(id);
     await db.del('pages', id);
     if (isFav) await db.update('books', book.id, { favoritePageId: null, updatedAt: Date.now() });
     toast('削除しました');
@@ -746,9 +913,10 @@ async function viewEdit(id) {
   };
   const write = async (value) => {
     const editedText = value === original ? '' : value;
-    await db.update('pages', id, { editedText, updatedAt: Date.now() });
+    const r = await marksMod.updatePageText(id, { editedText, updatedAt: Date.now() });
     await touchBook(page.bookId);
-    mark('保存しました ✓');
+    const moved = r.moved || {};
+    mark(moved.lost ? `保存しました（マーカー${moved.lost}件の位置が不明）` : '保存しました ✓');
     const state = $('#editState');
     if (state) state.textContent = editedText ? '（手直しあり）' : '';
     $('#resetEdit')?.toggleAttribute('hidden', !editedText);
@@ -847,7 +1015,7 @@ async function editTag(tag, n) {
 async function viewTag(id) {
   const tag = await db.get('tags', id);
   if (!tag) return go('#/tags');
-  const [pages, books, tags] = await Promise.all([db.getAll('pages'), db.getAll('books'), db.getAll('tags')]);
+  const [pages, books, tags, byPage] = await Promise.all([db.getAll('pages'), db.getAll('books'), db.getAll('tags'), marksByPage()]);
   const booksById = Object.fromEntries(books.map((b) => [b.id, b]));
   const tagsById = Object.fromEntries(tags.map((t) => [t.id, t]));
   const list = pages.filter((p) => p.tagIds?.includes(id));
@@ -875,7 +1043,7 @@ async function viewTag(id) {
       </select>
     </div>
     ${list.length
-      ? `<div class="pages">${list.map((p) => pageCard(p, { book: booksById[p.bookId], tagsById, isFav: booksById[p.bookId]?.favoritePageId === p.id })).join('')}</div>`
+      ? `<div class="pages">${list.map((p) => pageCard(p, { book: booksById[p.bookId], tagsById, isFav: booksById[p.bookId]?.favoritePageId === p.id, quote: cardQuote(p, byPage) })).join('')}</div>`
       : '<div class="empty small-empty"><p>このタグのついたページはまだありません</p></div>'}`;
 
   $('#sort').onchange = (e) => { pref.set('tagPageSort', e.target.value); render(true); };

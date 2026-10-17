@@ -384,3 +384,20 @@ dialog.viewer .zoom-frame img { height: 100%; }
 }
 .edit-screen.no-photo { height: auto; }
 .edit-screen.no-photo #editText { min-height: 60vh; }
+
+/* ---- 範囲選択とマーカー ---- */
+.sel-hint { margin: 0 0 6px; }
+.textview span.anchor { outline: 2px solid var(--accent); outline-offset: 1px; background: var(--accent-soft); }
+.textview span.sel { background: rgba(240, 141, 166, 0.28); box-shadow: 0 0 0 1px rgba(217, 102, 138, 0.35); }
+.textview span.mk { cursor: pointer; }
+.sel-bar {
+  position: fixed; left: 0; right: 0; bottom: calc(62px + env(safe-area-inset-bottom)); z-index: 12;
+  display: flex; align-items: center; gap: 8px; padding: 8px 14px;
+  background: #fffaf2; border-top: 1px solid var(--line); box-shadow: 0 -4px 14px rgba(150, 110, 90, .12);
+}
+.sel-bar .sel-quote { flex: 1; font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lost-box { margin-top: 10px; background: #fff6e5; border: 1px solid #f3d9a4; border-radius: 12px; padding: 10px 12px; }
+.lost-box p { margin: 0 0 6px; }
+.lost-box ul, .mark-menu { list-style: none; padding: 0; margin: 0; }
+.lost-box li, .mark-menu li { display: flex; align-items: center; gap: 6px; padding: 6px 0; border-top: 1px dashed #f0e0c0; font-size: 0.85rem; }
+.mark-menu li { border-top-color: var(--line); }
