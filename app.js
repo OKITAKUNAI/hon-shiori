@@ -1,7 +1,7 @@
 import * as db from './db.js';
 import { LS_PREFIX } from './config.js';
 import {
-  $, $$, esc, uid, TAG_COLORS, coverColor, resizeImage, blobToDataURL, dataURLToBlob,
+  $, $$, esc, uid, TAG_COLORS, coverColor, resizeImage,
   toast, debounce, THUMB_VERSION,
 } from './util.js';
 import { makeThumb, regenerateThumbs } from './thumbs.js';
@@ -9,6 +9,7 @@ import * as ocr from './ocr.js';
 import * as share from './share.js';
 import { renderText, makeZoomable } from './textview.js';
 import * as marksMod from './marks.js';
+import { exportBackup, importBackup, summarize } from './backup.js';
 
 const app = $('#app');
 
@@ -1098,11 +1099,7 @@ async function viewSettings() {
 
   $('#exportBtn').onclick = async () => {
     toast('書き出しています…');
-    const [books, tags, pages] = await Promise.all([db.getAll('books'), db.getAll('tags'), db.getAll('pages')]);
-    const data = {
-      app: 'hon-shiori', version: 1, exportedAt: Date.now(), books, tags,
-      pages: await Promise.all(pages.map(async (p) => ({ ...p, image: p.image ? await blobToDataURL(p.image) : null, thumb: p.thumb ? await blobToDataURL(p.thumb) : null }))),
-    };
+    const data = await exportBackup();
     const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -1114,16 +1111,17 @@ async function viewSettings() {
 
   $('#importInput').onchange = async (e) => {
     const file = e.target.files[0];
+    e.target.value = '';
     if (!file) return;
     try {
       const data = JSON.parse(await file.text());
-      if (data.app !== 'hon-shiori') throw new Error('ほんのしおりのバックアップではありません');
-      if (!confirm(`本${data.books.length}冊・ページ${data.pages.length}枚を読み込みます。同じデータは上書きされます。よろしいですか？`)) return;
-      for (const b of data.books) await db.put('books', b);
-      for (const t of data.tags) await db.put('tags', t);
-      for (const p of data.pages) {
-        await db.put('pages', { ...p, image: p.image ? await dataURLToBlob(p.image) : null, thumb: p.thumb ? await dataURLToBlob(p.thumb) : null });
-      }
+      const n = summarize(data);
+      if (!(await confirmDialog({
+        title: 'バックアップを読み込みますか？',
+        ok: '読み込む',
+        body: `<p>本${n.books}冊・ページ${n.pages}枚・タグ${n.tags}個${n.version >= 2 ? `・マーカー${n.marks}本` : ''}を読み込みます（version ${n.version} のバックアップ）。</p><p>同じデータは上書きされます。</p>`,
+      }))) return;
+      await importBackup(data);
       toast('読み込みました');
       go('#/');
       startThumbRegen();

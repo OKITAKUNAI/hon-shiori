@@ -8,6 +8,7 @@ import { preprocessForOcr } from './preprocess.js';
 import { makeAnchor, reanchor, isPlaced } from './anchor.js';
 import * as marksMod from './marks.js';
 import { renderText } from './textview.js';
+import { exportBackup, importBackup } from './backup.js';
 
 const TEST_DB = 'hon-shiori-test';
 const list = document.getElementById('results');
@@ -655,6 +656,50 @@ async function run() {
     assert(got.files.length === 1 && got.files[0].size === img.size, '画像を読み出せない');
     await share.deleteShare(id);
     assert((await share.readShare(id)) === null, '消えていない');
+  });
+
+
+  // ---- バックアップ ----
+  await test('バックアップ v2：書き出す → データを消す → 読み込むで、写真・全文・マーカー・設定が完全に戻る', async () => {
+    await db.setSetting('ocrPsmVertical', '3');
+    const snapshot = async () => {
+      const [books, tags, pages, marks, settings] = await Promise.all(['books', 'tags', 'pages', 'marks', 'settings'].map((s) => db.getAll(s)));
+      const norm = async (p) => ({ ...p, image: p.image ? await sha256(p.image) : null, thumb: p.thumb ? await sha256(p.thumb) : null });
+      const byId = (a, b) => String(a.id || a.key).localeCompare(String(b.id || b.key));
+      return JSON.stringify({
+        books: books.sort(byId), tags: tags.sort(byId), pages: (await Promise.all(pages.map(norm))).sort(byId),
+        marks: marks.sort(byId), settings: settings.filter((x) => x.key !== 'ocrReady').sort(byId),
+      });
+    };
+    const before = await snapshot();
+    const counts = JSON.parse(before);
+    assert(counts.pages.some((p) => p.image) && counts.pages.some((p) => !p.image) && counts.marks.length > 0, '確かめるデータが足りない');
+    const file = JSON.parse(JSON.stringify(await exportBackup())); // ファイルに書いて読み戻すのと同じ
+    assert(file.version === 2 && !file.settings.some((x) => x.key === 'ocrReady'), '形式が違う');
+    await db.closeDatabase();
+    await deleteDb(TEST_DB);
+    assert((await db.getAll('pages')).length === 0, '消えていない');
+    await importBackup(file);
+    const after = await snapshot();
+    assert(after === before, '戻したデータが違う');
+    const a = JSON.parse(after);
+    return `本${a.books.length}・ページ${a.pages.length}（写真なし${a.pages.filter((p) => !p.image).length}）・タグ${a.tags.length}・マーカー${a.marks.length}・設定${a.settings.length}`;
+  });
+
+  await test('version 1 のバックアップ（旧版の書き出し）も読み込める', async () => {
+    const img = await toBlob(drawPage(300, 400));
+    const dataUrl = await new Promise((r) => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(img); });
+    const v1 = {
+      app: 'hon-shiori', version: 1, exportedAt: Date.now(),
+      books: [{ id: 'v1b', title: '旧版の本', author: '', favoritePageId: null, createdAt: 1, updatedAt: 1 }],
+      tags: [{ id: 'v1t', name: '旧タグ', color: '#f6a5b9', createdAt: 1 }],
+      pages: [{ id: 'v1p', bookId: 'v1b', image: dataUrl, thumb: dataUrl, comment: '旧版のメモ', tagIds: ['v1t'], createdAt: 1, updatedAt: 1 }],
+    };
+    const info = await importBackup(JSON.parse(JSON.stringify(v1)));
+    const p = await db.get('pages', 'v1p');
+    assert(info.version === 1 && p.comment === '旧版のメモ' && p.tagIds[0] === 'v1t', JSON.stringify(info));
+    assert((await sha256(p.image)) === (await sha256(img)), '写真が違う');
+    assert(ocr.adoptedText(p).text === '' && (await db.get('books', 'v1b')).title === '旧版の本', '本か文章が違う');
   });
 
   await db.closeDatabase();

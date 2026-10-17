@@ -5,7 +5,7 @@ const IS_BETA =
   /-beta(\/|$)/.test(self.location.pathname) ||
   ['localhost', '127.0.0.1', '[::1]'].includes(self.location.hostname);
 const PREFIX = IS_BETA ? 'hon-shiori-beta-' : 'hon-shiori-';
-const CACHE = PREFIX + 'v6';
+const CACHE = PREFIX + 'v7';
 // 文字認識のエンジンと言語データ（どちらも vendor/ に同梱）。フォルダ名にバージョンが入っていて中身が変わらないので、
 // アプリ本体を更新しても消さずに使い続ける（数MBあるため、毎回取り直さない）。
 // インストール時にまとめて取得はせず、使う向きの分だけ初回の認識の前に取得したものを保存する
@@ -14,7 +14,7 @@ const SHARE_CACHE = PREFIX + 'share';     // 共有で受け取った内容の�
 const KEEP = [CACHE, LANG_CACHE, SHARE_CACHE];
 const SHELL = [
   './', 'index.html', 'style.css', 'app.js', 'config.js', 'db.js', 'util.js', 'thumbs.js', 'ocr.js', 'preprocess.js', 'share.js',
-  'textview.js', 'text.js', 'anchor.js', 'marks.js',
+  'textview.js', 'text.js', 'anchor.js', 'marks.js', 'backup.js',
   IS_BETA ? 'manifest-beta.json' : 'manifest.json', 'icon-192.png', 'icon-512.png',
 ];
 const APP_ROOT = new URL('./', self.location).pathname;
