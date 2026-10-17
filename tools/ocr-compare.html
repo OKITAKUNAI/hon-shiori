@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>保存サイズと読み方の比較</title>
+  <link rel="stylesheet" href="../style.css">
+  <style>
+    body { padding: 16px; max-width: 980px; margin: 0 auto; }
+    h1 { font-size: 1.3rem; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; background: #fff; margin: 8px 0 16px; }
+    th, td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; }
+    thead th { background: var(--cream); }
+    .best { background: #e6f5ec; font-weight: 700; }
+    #log { font-size: 0.8rem; color: var(--sub); white-space: pre-wrap; }
+    details { background: #fff; border-radius: 12px; padding: 8px 12px; margin: 6px 0; }
+    details pre { white-space: pre-wrap; font-size: 0.8rem; max-height: 240px; overflow: auto; }
+    .vt { writing-mode: vertical-rl; height: 220px; overflow-x: auto; font-size: 0.85rem; line-height: 1.8; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  </style>
+</head>
+<body>
+  <h1>保存サイズと読み方（PSM）の比較</h1>
+  <p class="small">写真を、アプリと同じ方法で 1568 / 2400 / 3200px に縮小して保存したときの容量と、それぞれを PSM 5（縦書きの1つのかたまり）と PSM 3（自動判定）で読み取った結果を比べます。読み取りはアプリと同じ前処理（グレースケール化・コントラスト調整）を通します。</p>
+  <p class="small">写真は <code>private/</code> フォルダ（Git の管理外）に置くと自動で読み込みます。同じ名前の <code>.txt</code>（例：<code>p1.jpg</code> なら <code>p1.txt</code>）に正しい文章を書いておくと一致率を計算します。処理はすべてこのパソコンの中で行い、どこにも送信しません。</p>
+
+  <div class="controls">
+    <label class="btn soft small">写真を選ぶ<input type="file" id="pick" accept="image/*,.txt" multiple hidden></label>
+    <label class="small">文字の向き
+      <select id="mode"><option value="vertical">縦書き（jpn_vert）</option><option value="horizontal">横書き（jpn）</option></select></label>
+    <button class="btn primary small" id="run" disabled>比較を始める</button>
+    <button class="btn ghost small" id="sample">見本（canvas）で試す</button>
+    <button class="btn ghost small" id="copy" disabled>表をコピー（数字だけ）</button>
+  </div>
+  <p class="small" id="files">写真：まだありません</p>
+  <p id="log"></p>
+
+  <h2 class="sec">まとめ（平均）</h2>
+  <div id="summary"><p class="muted small">比較が終わると表示します</p></div>
+  <h2 class="sec">写真ごとの結果</h2>
+  <div id="detail"></div>
+
+  <script type="module" src="ocr-compare.js"></script>
+</body>
+</html>
