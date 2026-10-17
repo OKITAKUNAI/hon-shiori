@@ -338,3 +338,49 @@ html.beta .beta-bar {
   display: flex; align-items: center; justify-content: center; aspect-ratio: 3 / 4; font-size: 0.75rem; color: var(--sub); padding: 4px;
 }
 .pick-card .pick-text { writing-mode: vertical-rl; overflow: hidden; color: var(--ink); }
+
+/* ---- 文章の表示（縦書き／横書き） ---- */
+.text-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.text-bar .btn.small { padding: 6px 10px; }
+.seg.mini { margin: 0; flex: 0 0 auto; }
+.seg.mini button { padding: 4px 12px; font-size: 0.82rem; }
+.textview {
+  font-family: 'Zen Old Mincho', 'Hiragino Mincho ProN', 'Yu Mincho', 'Noto Serif JP', serif;
+  font-size: 1.08rem; color: var(--ink); background: #fffcf6; border-radius: 12px;
+  border: 1px solid var(--line); padding: 14px; user-select: text; -webkit-user-select: text;
+}
+.textview.vertical {
+  writing-mode: vertical-rl; text-orientation: mixed;
+  width: 100%; height: min(62vh, 520px); overflow-x: auto; overflow-y: hidden;
+  line-height: 2.1; letter-spacing: 0.06em;
+}
+.textview.horizontal { line-height: 2; max-height: 62vh; overflow-y: auto; }
+.textview span { border-radius: 2px; }
+.textview .text-empty { color: var(--sub); font-family: var(--font); font-size: 0.9rem; margin: 0; }
+.text-meta { margin-top: 6px; }
+details.sources { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 8px; }
+details.sources summary { cursor: pointer; font-size: 0.88rem; color: var(--sub); padding: 4px 0; }
+details.sources[open] summary { margin-bottom: 6px; }
+.btn.disabled { pointer-events: none; opacity: 0.45; }
+
+/* ---- 写真の拡大 ---- */
+.zoom-frame { overflow: hidden; position: relative; background: #2a2320; border-radius: 12px; }
+.zoom-frame img { width: 100%; height: 100%; object-fit: contain; transform-origin: center; will-change: transform; user-select: none; -webkit-user-drag: none; }
+dialog.viewer .zoom-frame { width: 100vw; height: calc(100vh - 40px); border-radius: 0; background: transparent; }
+dialog.viewer .zoom-frame img { height: 100%; }
+.viewer-close {
+  position: fixed; top: calc(env(safe-area-inset-top) + 10px); right: 12px; width: 44px; height: 44px; border-radius: 50%;
+  border: none; background: rgba(255,255,255,.9); font-size: 1.2rem; cursor: pointer;
+}
+
+/* ---- 手直しの画面 ---- */
+.edit-screen { display: flex; flex-direction: column; gap: 6px; height: calc(100dvh - 190px); min-height: 420px; }
+.edit-photo { flex: 0 0 45%; }
+.edit-screen .tiny.center { margin: 0; }
+.edit-meta { margin: 0; }
+#editText {
+  flex: 1; resize: none; font-size: 1rem; line-height: 1.8; min-height: 140px;
+  font-family: 'Hiragino Mincho ProN', 'Yu Mincho', 'Noto Serif JP', serif;
+}
+.edit-screen.no-photo { height: auto; }
+.edit-screen.no-photo #editText { min-height: 60vh; }

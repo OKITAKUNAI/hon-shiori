@@ -7,6 +7,7 @@ import {
 import { makeThumb, regenerateThumbs } from './thumbs.js';
 import * as ocr from './ocr.js';
 import * as share from './share.js';
+import { renderText, makeZoomable } from './textview.js';
 
 const app = $('#app');
 
@@ -176,12 +177,19 @@ async function ensureOcrReady(mode) {
 
 const WRITING_MODE_OPTIONS = [['vertical', '縦書き（ふつうの小説など）'], ['horizontal', '横書き']];
 
+// 写真の拡大表示。指で広げて拡大、ドラッグで移動、ダブルタップで拡大／元に戻す
 function showImage(blob) {
   const dlg = document.createElement('dialog');
   dlg.className = 'viewer';
-  dlg.innerHTML = `<img src="${blobUrl(blob)}" alt="ページの写真"><p class="hint">タップで閉じる</p>`;
+  dlg.innerHTML = `
+    <div class="zoom-frame"><img src="${blobUrl(blob)}" alt="ページの写真"></div>
+    <button type="button" class="viewer-close" aria-label="閉じる">✕</button>
+    <p class="hint">指で広げて拡大・ダブルタップで拡大／元に戻す</p>`;
   document.body.append(dlg);
-  dlg.onclick = () => { dlg.close(); dlg.remove(); };
+  makeZoomable(dlg.querySelector('.zoom-frame'), dlg.querySelector('img'));
+  const close = () => { dlg.close(); dlg.remove(); };
+  dlg.querySelector('.viewer-close').onclick = close;
+  dlg.addEventListener('cancel', close);
   dlg.showModal();
 }
 
@@ -443,6 +451,8 @@ async function viewBook(id) {
 // ---------- 1ページの詳細 ----------
 
 const pageTextTab = new Map(); // ページごとに、最後に開いていた「読み取り結果／貼り付け」のタブ
+const pageTextDir = new Map(); // ページごとの表示の向き（縦書き／横書き）。初期値はページの文字の向き
+const SOURCE_LABEL = { ocr: '読み取り結果', paste: '貼り付け' };
 
 function statusLabel(p) {
   if (p.ocrStatus === 'running' && ocr.currentProgress.pageId === p.id) return `読み取り中… ${Math.round(ocr.currentProgress.value * 100)}%`;
@@ -473,6 +483,8 @@ async function viewPage(id) {
   const adopted = hasOcr || hasPaste ? ocr.adoptedText(page).source : null;
   const bookMode = book.writingMode || 'vertical';
   const textTab = pageTextTab.get(id) || adopted || 'ocr';
+  const shown = ocr.adoptedText(page);
+  const vertical = (pageTextDir.get(id) || ocr.pageMode(page, book)) === 'vertical';
 
   // 変えた項目だけを書き込む（裏で作り直したサムネなどを古い値で上書きしないため）
   const save = async (patch) => {
@@ -496,6 +508,19 @@ async function viewPage(id) {
 
     <section class="card" id="textCard">
       <h3 class="sec">文章 ${page.image ? `<span class="ocr-chip st-${status}" id="ocrStatus">${esc(statusLabel(page))}</span>` : '<span class="ocr-chip">写真なし</span>'}</h3>
+      <div class="text-bar">
+        <div class="seg mini" role="group" aria-label="表示の向き">
+          <button type="button" data-dir="vertical" class="${vertical ? 'on' : ''}">縦書き</button>
+          <button type="button" data-dir="horizontal" class="${vertical ? '' : 'on'}">横書き</button>
+        </div>
+        <span class="grow"></span>
+        ${page.image ? '<button type="button" class="btn ghost small" id="zoomPhoto">📷 写真</button>' : ''}
+        <a class="btn soft small ${shown.text ? '' : 'disabled'}" href="#/page/${id}/edit">✏️ 直す</a>
+      </div>
+      <div class="textview" id="textView"></div>
+      ${shown.text ? `<p class="tiny muted text-meta">元の文章：${SOURCE_LABEL[shown.source]}${shown.edited ? '（手直しあり）' : ''}</p>` : ''}
+      <details class="sources" ${pageTextTab.has(id) ? 'open' : ''}>
+        <summary>読み取り結果と貼り付け（原文）</summary>
       ${page.image ? `<div class="row text-tools">
         <label class="inline small">向き
           <select id="pageMode" aria-label="文字の向き">
@@ -525,6 +550,7 @@ async function viewPage(id) {
         </div>
       </div>
       <span class="saved" id="textSaved"></span>
+      </details>
     </section>
 
     <section class="card">
@@ -543,6 +569,18 @@ async function viewPage(id) {
     <div class="row center"><button class="btn ghost danger small" id="delPage">このページを削除</button></div>`;
 
   $('#photo')?.addEventListener('click', () => showImage(page.image));
+  $('#zoomPhoto')?.addEventListener('click', () => showImage(page.image));
+
+  // --- 文章の表示（縦書き／横書き） ---
+  const drawText = () => renderText($('#textView'), ocr.adoptedText(page).text, { vertical: pageTextDir.get(id) ? pageTextDir.get(id) === 'vertical' : vertical });
+  drawText();
+  for (const b of $$('[data-dir]')) {
+    b.onclick = () => {
+      pageTextDir.set(id, b.dataset.dir);
+      for (const x of $$('[data-dir]')) x.classList.toggle('on', x === b);
+      drawText();
+    };
+  }
 
   // --- 文章（読み取り結果・貼り付け） ---
   const textSavedMark = () => {
@@ -560,7 +598,7 @@ async function viewPage(id) {
 
   for (const b of $$('[data-tab]', $('#textCard'))) {
     b.onclick = () => {
-      pageTextTab.set(id, b.dataset.tab);
+      pageTextTab.set(id, b.dataset.tab); // 原文の欄を開いたままにする
       for (const x of $$('[data-tab]', $('#textCard'))) x.classList.toggle('on', x === b);
       for (const p of $$('[data-pane]', $('#textCard'))) p.hidden = p.dataset.pane !== b.dataset.tab;
     };
@@ -670,6 +708,66 @@ async function viewPage(id) {
     if (isFav) await db.update('books', book.id, { favoritePageId: null, updatedAt: Date.now() });
     toast('削除しました');
     go('#/book/' + book.id);
+  };
+}
+
+// ---------- 文章の手直し ----------
+// 上半分に元の写真（指で拡大）、下半分に横書きの入力欄。入力が止まって600ミリ秒後に自動で保存する。
+// 手直しは editedText に保存し、原文（ocrText / pasteText）には触れない。原文と同じに戻したら editedText は空にする
+
+async function viewEdit(id) {
+  const page = await db.get('pages', id);
+  if (!page) return go('#/');
+  const shown = ocr.adoptedText(page);
+  const original = ocr.sourceText(page, shown.source);
+
+  app.innerHTML = `
+    <div class="topbar">
+      <a href="#/page/${id}" class="back">‹ ページに戻る</a>
+      <span class="saved" id="editSaved"></span>
+    </div>
+    <div class="edit-screen ${page.image ? '' : 'no-photo'}">
+      ${page.image ? `<div class="zoom-frame edit-photo" id="editPhoto"><img src="${blobUrl(page.image)}" alt="ページの写真"></div>
+      <p class="tiny muted center">写真は指で広げて拡大・ダブルタップで拡大／元に戻す</p>` : ''}
+      <div class="row edit-meta">
+        <span class="small muted grow">元の文章：${SOURCE_LABEL[shown.source]} <span id="editState">${shown.edited ? '（手直しあり）' : ''}</span></span>
+        <button type="button" class="btn ghost small" id="resetEdit" ${shown.edited ? '' : 'hidden'}>手直しを取り消す</button>
+      </div>
+      <textarea id="editText" spellcheck="false">${esc(shown.text)}</textarea>
+    </div>`;
+
+  if (page.image) makeZoomable($('#editPhoto'), $('#editPhoto img'));
+
+  const ta = $('#editText');
+  const mark = (msg) => {
+    const el = $('#editSaved');
+    if (!el) return;
+    el.textContent = msg;
+  };
+  const write = async (value) => {
+    const editedText = value === original ? '' : value;
+    await db.update('pages', id, { editedText, updatedAt: Date.now() });
+    await touchBook(page.bookId);
+    mark('保存しました ✓');
+    const state = $('#editState');
+    if (state) state.textContent = editedText ? '（手直しあり）' : '';
+    $('#resetEdit')?.toggleAttribute('hidden', !editedText);
+  };
+  const saveLater = debounce(write, 600);
+  let dirty = false;
+  ta.oninput = () => { dirty = true; mark('…'); saveLater(ta.value); };
+  // 画面を離れるときに、まだ保存していない入力を書き込む
+  onLeave(() => { if (dirty) { saveLater.cancel?.(); write(ta.value); } });
+
+  $('#resetEdit').onclick = async () => {
+    if (!(await confirmDialog({
+      title: '手直しを取り消しますか？',
+      ok: '取り消す',
+      body: `<p>手で直した文章を消して、元の文章（${SOURCE_LABEL[shown.source]}）に戻します。</p>`,
+    }))) return;
+    ta.value = original;
+    dirty = false;
+    await write(original);
   };
 }
 
@@ -979,6 +1077,7 @@ async function viewShare(shareId) {
 const routes = [
   [/^#\/book\/(\w+)$/, viewBook, 'shelf'],
   [/^#\/page\/(\w+)$/, viewPage, 'shelf'],
+  [/^#\/page\/(\w+)\/edit$/, viewEdit, 'shelf'],
   [/^#\/tags$/, viewTags, 'tags'],
   [/^#\/tag\/(\w+)$/, viewTag, 'tags'],
   [/^#\/settings$/, viewSettings, 'settings'],
