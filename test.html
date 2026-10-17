@@ -15,6 +15,9 @@
     #results li.fail::before { content: '❌ '; }
     #results small { display: block; color: var(--sub); white-space: pre-wrap; }
     #summary { font-weight: 700; }
+    table.psm { width: 100%; border-collapse: collapse; font-size: 0.85rem; background: #fff; }
+    table.psm th, table.psm td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    table.psm td.vt { writing-mode: vertical-rl; max-height: 16em; line-height: 1.8; }
   </style>
 </head>
 <body>
@@ -22,6 +25,9 @@
   <p class="muted small">テスト専用のデータベース（hon-shiori-test）だけを使います。本番・試験版のデータには触れません。見本の画像はすべて canvas で描いたものです。</p>
   <p id="summary">実行中…</p>
   <ul id="results"></ul>
+
+  <h2 class="sec">縦書きの読み方の比較（PSM 5 と PSM 3）</h2>
+  <table class="psm"><thead><tr><th></th><th>一致率</th><th>時間</th><th>読み取った文章</th></tr></thead><tbody id="psmCompare"><tr><td colspan="4">テスト後に表示します</td></tr></tbody></table>
 
   <h2 class="sec">カードの見た目（D案の見本）</h2>
   <div class="pages" id="preview"></div>

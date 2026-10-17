@@ -127,16 +127,6 @@ select {
 .empty .big { font-size: 3rem; }
 .small-empty { padding: 28px 12px; }
 
-/* ---- ページ追加 ---- */
-.add-photos {
-  display: flex; align-items: center; gap: 14px; cursor: pointer;
-  background: var(--card); border: 2px dashed #f5c3cf; border-radius: var(--radius);
-  padding: 16px 18px; margin: 8px 0 16px; line-height: 1.5;
-}
-.add-photos:active { background: var(--accent-soft); }
-.ap-icon { font-size: 1.9rem; }
-.add-photos small { color: var(--sub); }
-
 /* ---- ページのカード ---- */
 /* カードの最大幅は 240px（サムネは幅600pxで作るので、画素密度2.5倍の画面まで粗くならない） */
 /* （列の上限を grid で指定すると列数が減るので、上限はカード側にかける） */
@@ -326,3 +316,25 @@ html.beta .beta-bar {
   font-size: 0.8rem; color: var(--sub); text-align: center; padding: 4px 8px;
 }
 .progress-bar i { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--accent); transition: width .2s; }
+
+/* ---- ページの追加（撮る／写真から選ぶ／文章だけ） ---- */
+.add-row { display: grid; grid-template-columns: 1.1fr 1.1fr 1fr; gap: 8px; margin: 8px 0 16px; }
+.add-btn {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  background: var(--card); border: 2px dashed #f5c3cf; border-radius: var(--radius);
+  padding: 12px 6px; cursor: pointer; font: inherit; color: var(--ink); font-size: 0.88rem; min-height: 76px;
+}
+.add-btn:active { background: var(--accent-soft); }
+.add-btn.primary-add { background: var(--accent); border: none; color: #fff; }
+.add-btn .ap-icon { font-size: 1.6rem; line-height: 1.2; }
+.add-btn b { white-space: nowrap; font-size: 0.82rem; }
+
+/* 写真のないページのことばカード（紙の色） */
+.thumb.words.paper { background: #fbf4ea; }
+.thumb.words.paper::before { display: none; }
+.thumb.words.paper .words-text { text-decoration: none; padding-right: 14px; }
+
+.pick-card.new-page, .pick-card .pick-text {
+  display: flex; align-items: center; justify-content: center; aspect-ratio: 3 / 4; font-size: 0.75rem; color: var(--sub); padding: 4px;
+}
+.pick-card .pick-text { writing-mode: vertical-rl; overflow: hidden; color: var(--ink); }

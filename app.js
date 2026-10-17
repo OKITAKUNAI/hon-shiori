@@ -73,6 +73,33 @@ function formDialog({ title, fields, submit = '保存', danger }) {
   });
 }
 
+// 長い文章を入力するダイアログ。入力した文章（空なら null）を返す
+function textDialog({ title, placeholder = '', value = '', submit = '保存' }) {
+  return new Promise((resolve) => {
+    const dlg = document.createElement('dialog');
+    dlg.className = 'sheet';
+    dlg.innerHTML = `
+      <h3>${esc(title)}</h3>
+      <textarea rows="8" placeholder="${esc(placeholder)}">${esc(value)}</textarea>
+      <div class="row-end">
+        <button type="button" class="btn ghost" data-paste>📋 貼り付け</button><span class="grow"></span>
+        <button type="button" class="btn ghost" data-no>やめる</button>
+        <button type="button" class="btn primary" data-yes>${esc(submit)}</button>
+      </div>`;
+    document.body.append(dlg);
+    const ta = dlg.querySelector('textarea');
+    const done = (v) => { dlg.close(); dlg.remove(); resolve(v); };
+    dlg.querySelector('[data-no]').onclick = () => done(null);
+    dlg.querySelector('[data-yes]').onclick = () => done(ta.value.trim() || null);
+    dlg.querySelector('[data-paste]').onclick = async () => {
+      try { ta.value += await navigator.clipboard.readText(); } catch { toast('欄を長押しして「貼り付け」を選んでください'); ta.focus(); }
+    };
+    dlg.addEventListener('cancel', (e) => { e.preventDefault(); done(null); });
+    dlg.showModal();
+    ta.focus();
+  });
+}
+
 // はい／いいえを聞くダイアログ
 function confirmDialog({ title, body, ok = 'OK', cancel = 'やめる' }) {
   return new Promise((resolve) => {
@@ -180,11 +207,7 @@ async function addPagesFromFiles(bookId, files, { pasteText = '' } = {}) {
   for (const [i, file] of files.entries()) {
     try {
       const [image, thumb] = await Promise.all([resizeImage(file, 1568), makeThumb(file)]);
-      const page = {
-        id: uid(), bookId, image, thumb, thumbVersion: THUMB_VERSION, comment: '', tagIds: [],
-        ocrStatus: 'none', ocrText: '', pasteText: i === 0 ? pasteText : '', textSource: null, writingMode: null,
-        createdAt: base + i, updatedAt: base + i,
-      };
+      const page = newPage(bookId, { image, thumb, thumbVersion: THUMB_VERSION, pasteText: i === 0 ? pasteText : '', createdAt: base + i });
       await db.put('pages', page);
       ids.push(page.id);
     } catch (err) {
@@ -193,22 +216,51 @@ async function addPagesFromFiles(bookId, files, { pasteText = '' } = {}) {
     }
   }
   await touchBook(bookId);
-  const mode = ocr.pageMode({}, book);
-  if (auto && ids.length && (await ocr.isReady(mode))) {
-    for (const id of ids) await ocr.enqueue(id);
-  }
+  if (auto && ids.length) startAutoOcr(ids, ocr.pageMode({}, book)); // 待たずに戻る
   return ids;
+}
+
+// ページの項目（写真のないページは image / thumb が null）
+function newPage(bookId, fields = {}) {
+  const now = fields.createdAt || Date.now();
+  return {
+    id: uid(), bookId, image: null, thumb: null, thumbVersion: THUMB_VERSION, comment: '', tagIds: [],
+    ocrStatus: 'none', ocrText: '', editedText: '', pasteText: '', textSource: null,
+    writingMode: null, ocrLang: null, ocrPsm: null,
+    createdAt: now, updatedAt: now,
+    ...fields,
+  };
+}
+
+// 写真のない、貼り付けた文章だけのページを作る
+async function addTextPage(bookId, text) {
+  const page = newPage(bookId, { pasteText: text, textSource: 'paste' });
+  await db.put('pages', page);
+  await touchBook(bookId);
+  return page.id;
+}
+
+// 撮影・選択のあと自動で読み取る。初回だけは容量を伝えて同意をもらう（断られたら、この起動中は聞かない）
+let ocrDeclinedThisSession = false;
+async function startAutoOcr(ids, mode) {
+  if (!(await ocr.isReady(mode))) {
+    if (ocrDeclinedThisSession) return;
+    if (!(await ensureOcrReady(mode))) { ocrDeclinedThisSession = true; return; }
+  }
+  for (const id of ids) await ocr.enqueue(id);
 }
 
 const OCR_BADGE = { queued: '⏳', running: '🔍', failed: '⚠️' };
 
 // ページのカード。quote（マーカーした一文）を渡すと「ことば」表示（D案）になる：
 // 一文を縦書きで大きく出し、マーカー色をアクセントに、写真は背景に薄く敷く
+// 写真のないページは、マーカーがあれば代表の一文、なければ採用中の文章の冒頭を縦書きで出す（背景は紙の色）
 function pageCard(p, { book, tagsById, isFav, quote } = {}) {
   const tags = (p.tagIds || []).map((id) => tagsById?.[id]).filter(Boolean);
+  if (!p.thumb && !quote) quote = { text: ocr.adoptedText(p).text.slice(0, 80) || '（文章なし）', color: 'transparent' };
   const visual = quote
-    ? `<div class="thumb words" style="--mc:${quote.color}">
-        <img class="words-bg" src="${blobUrl(p.thumb)}" alt="" loading="lazy">
+    ? `<div class="thumb words ${p.thumb ? '' : 'paper'}" style="--mc:${quote.color}">
+        ${p.thumb ? `<img class="words-bg" src="${blobUrl(p.thumb)}" alt="" loading="lazy">` : ''}
         <p class="words-text">${esc(quote.text)}</p>`
     : `<div class="thumb"><img src="${blobUrl(p.thumb)}" alt="" loading="lazy">`;
   const badge = OCR_BADGE[p.ocrStatus];
@@ -236,7 +288,9 @@ async function viewShelf() {
 
   const cover = (b) => {
     const ps = byBook[b.id] || [];
-    const p = ps.find((x) => x.id === b.favoritePageId) || ps[0];
+    // ★のページが写真のないページなら色付きの表紙。★がなければ、写真のある最初のページ
+    const fav = ps.find((x) => x.id === b.favoritePageId);
+    const p = fav ? (fav.thumb ? fav : null) : ps.find((x) => x.thumb);
     return p
       ? `<img src="${blobUrl(p.thumb)}" alt="">`
       : `<div class="placeholder" style="background:${coverColor(b.id)}"><span>📖</span><b>${esc(b.title)}</b></div>`;
@@ -317,11 +371,20 @@ async function viewBook(id) {
       </div>
     </header>
 
-    <label class="add-photos">
-      <input type="file" accept="image/*" multiple id="photoInput" hidden>
-      <span class="ap-icon">📷</span>
-      <span><b>ページを追加</b><br><small>撮影 または 写真を選ぶ（何枚でも）</small></span>
-    </label>
+    <div class="add-row">
+      <!-- Android では capture 付きの入力からギャラリーを選べないので、撮影と選択を分ける -->
+      <label class="add-btn primary-add">
+        <input type="file" accept="image/*" capture="environment" id="cameraInput" hidden>
+        <span class="ap-icon">📷</span><b>撮る</b>
+      </label>
+      <label class="add-btn">
+        <input type="file" accept="image/*" multiple id="photoInput" hidden>
+        <span class="ap-icon">🖼️</span><b>写真から選ぶ</b>
+      </label>
+      <button type="button" class="add-btn" id="addText">
+        <span class="ap-icon">📝</span><b>文章だけ</b>
+      </button>
+    </div>
 
     ${pages.length ? `
       <p class="muted small hint-line">★がついたページが本棚の表紙になります</p>
@@ -330,13 +393,22 @@ async function viewBook(id) {
       </div>` : `
       <div class="empty small-empty"><p>好きなページを撮って、ここに集めましょう</p></div>`}`;
 
-  $('#photoInput').onchange = async (e) => {
+  const onFiles = async (e) => {
     const files = [...e.target.files];
+    e.target.value = '';
     if (!files.length) return;
     toast(`${files.length}枚を保存しています…`);
     const ids = await addPagesFromFiles(id, files);
     if (files.length === 1 && ids[0]) go('#/page/' + ids[0]);
     else { toast(`${ids.length}枚追加しました`); render(true); }
+  };
+  $('#cameraInput').onchange = onFiles;
+  $('#photoInput').onchange = onFiles;
+
+  $('#addText').onclick = async () => {
+    const text = await textDialog({ title: '文章だけのページを追加', placeholder: 'Googleレンズなどでコピーした文章を貼り付けます', submit: '追加' });
+    if (!text) return;
+    go('#/page/' + (await addTextPage(id, text)));
   };
 
   // 裏の文字認識の進み具合をカードの印に反映する
@@ -371,6 +443,11 @@ async function viewBook(id) {
 // ---------- 1ページの詳細 ----------
 
 const pageTextTab = new Map(); // ページごとに、最後に開いていた「読み取り結果／貼り付け」のタブ
+
+function statusLabel(p) {
+  if (p.ocrStatus === 'running' && ocr.currentProgress.pageId === p.id) return `読み取り中… ${Math.round(ocr.currentProgress.value * 100)}%`;
+  return ocr.STATUS_LABEL[p.ocrStatus || 'none'];
+}
 
 function useButton(src, adopted) {
   return adopted === src
@@ -409,7 +486,7 @@ async function viewPage(id) {
       <span class="muted small">${idx + 1} / ${siblings.length}</span>
     </div>
 
-    <figure class="photo" id="photo"><img src="${blobUrl(page.image)}" alt="ページの写真"></figure>
+    ${page.image ? `<figure class="photo" id="photo"><img src="${blobUrl(page.image)}" alt="ページの写真"></figure>` : ''}
 
     <div class="nav-row">
       ${prev ? `<a class="btn ghost small" href="#/page/${prev.id}">‹ 前</a>` : '<span class="btn ghost small disabled">‹ 前</span>'}
@@ -418,8 +495,8 @@ async function viewPage(id) {
     </div>
 
     <section class="card" id="textCard">
-      <h3 class="sec">文章 <span class="ocr-chip st-${status}" id="ocrStatus">${esc(ocr.STATUS_LABEL[status])}</span></h3>
-      <div class="row text-tools">
+      <h3 class="sec">文章 ${page.image ? `<span class="ocr-chip st-${status}" id="ocrStatus">${esc(statusLabel(page))}</span>` : '<span class="ocr-chip">写真なし</span>'}</h3>
+      ${page.image ? `<div class="row text-tools">
         <label class="inline small">向き
           <select id="pageMode" aria-label="文字の向き">
             <option value="" ${page.writingMode ? '' : 'selected'}>本の設定（${ocr.MODES[bookMode].label}）</option>
@@ -427,14 +504,16 @@ async function viewPage(id) {
             <option value="horizontal" ${page.writingMode === 'horizontal' ? 'selected' : ''}>横書き</option>
           </select>
         </label>
-        <button class="btn soft small" id="ocrRun" ${status === 'queued' || status === 'running' ? 'disabled' : ''}>🔍 ${page.ocrText ? 'もう一度読み取る' : '文字を読み取る'}</button>
-      </div>
+        ${status === 'queued' || status === 'running'
+          ? '<button class="btn ghost small" id="ocrCancel">読み取りをやめる</button>'
+          : `<button class="btn soft small" id="ocrRun">🔍 ${page.ocrText ? 'もう一度読み取る' : '文字を読み取る'}</button>`}
+      </div>` : ''}
       <div class="seg" role="tablist">
         <button type="button" role="tab" data-tab="ocr" class="${textTab === 'ocr' ? 'on' : ''}">読み取り結果${adopted === 'ocr' ? '<i>使用中</i>' : ''}</button>
         <button type="button" role="tab" data-tab="paste" class="${textTab === 'paste' ? 'on' : ''}">貼り付け${adopted === 'paste' ? '<i>使用中</i>' : ''}</button>
       </div>
       <div data-pane="ocr" ${textTab === 'ocr' ? '' : 'hidden'}>
-        <textarea id="ocrText" rows="6" placeholder="「文字を読み取る」を押すと、写真の文章をここに書き出します">${esc(page.ocrText || '')}</textarea>
+        <textarea id="ocrText" rows="6" readonly placeholder="${page.image ? '「文字を読み取る」を押すと、写真の文章をここに書き出します' : '写真のないページです'}">${esc(page.ocrText || '')}</textarea>
         ${status === 'failed' ? `<p class="tiny err">読み取れませんでした（${esc(page.ocrError || '原因不明')}）。もう一度試すか、貼り付けを使ってください。</p>` : ''}
         <div class="row">${hasOcr ? useButton('ocr', adopted) : ''}</div>
       </div>
@@ -463,7 +542,7 @@ async function viewPage(id) {
 
     <div class="row center"><button class="btn ghost danger small" id="delPage">このページを削除</button></div>`;
 
-  $('#photo').onclick = () => showImage(page.image);
+  $('#photo')?.addEventListener('click', () => showImage(page.image));
 
   // --- 文章（読み取り結果・貼り付け） ---
   const textSavedMark = () => {
@@ -472,13 +551,11 @@ async function viewPage(id) {
     s.textContent = '保存しました ✓';
     setTimeout(() => { if (s.isConnected) s.textContent = ''; }, 1500);
   };
-  const saveOcrText = debounce(async (v) => { await save({ ocrText: v }); textSavedMark(); }, 600);
   const savePasteText = debounce(async (v) => {
     // 貼り付けた文章があり、まだどちらも選んでいなければ貼り付けを使う
     await save({ pasteText: v, ...(page.textSource ? {} : { textSource: v.trim() ? 'paste' : null }) });
     textSavedMark();
   }, 600);
-  $('#ocrText').oninput = (e) => saveOcrText(e.target.value);
   $('#pasteText').oninput = (e) => savePasteText(e.target.value);
 
   for (const b of $$('[data-tab]', $('#textCard'))) {
@@ -490,7 +567,13 @@ async function viewPage(id) {
   }
   for (const b of $$('[data-use]')) {
     b.onclick = async () => {
-      await save({ textSource: b.dataset.use });
+      // 手で直した文章があると、切り替えても画面の文章は変わらないので、手直しを外してよいか確かめる
+      if (page.editedText && !(await confirmDialog({
+        title: '使う文章を切り替えますか？',
+        ok: '切り替える',
+        body: '<p>このページには手で直した文章があります。切り替えると<b>手で直した文章は使われなくなり（消えます）</b>、切り替え先の原文を表示します。</p><p>マーカーは切り替え先の文章の中で位置を探し直します。見つからないものは「位置不明」になります。</p>',
+      }))) return;
+      await save({ textSource: b.dataset.use, editedText: '' });
       toast(b.dataset.use === 'ocr' ? '読み取り結果を使います' : '貼り付けた文章を使います');
       render(true);
     };
@@ -508,31 +591,42 @@ async function viewPage(id) {
     }
   };
 
-  $('#pageMode').onchange = async (e) => {
+  $('#ocrCancel')?.addEventListener('click', async () => {
+    await ocr.cancel(id);
+    toast('読み取りをやめました');
+  });
+
+  // 読み取り中の進捗率
+  onLeave(ocr.onOcrProgress((pid, v) => {
+    const chip = $('#ocrStatus');
+    if (pid === id && chip) chip.textContent = `読み取り中… ${Math.round(v * 100)}%`;
+  }));
+
+  $('#pageMode')?.addEventListener('change', async (e) => {
     await save({ writingMode: e.target.value || null });
     toast('向きを変えました。「もう一度読み取る」で読み直せます');
-  };
+  });
 
-  $('#ocrRun').onclick = async () => {
+  $('#ocrRun')?.addEventListener('click', async () => {
     const mode = ocr.pageMode(page, book);
     if (page.ocrText?.trim() && !(await confirmDialog({
       title: 'もう一度読み取りますか？',
-      body: '<p>今の読み取り結果（直した部分も含む）は、新しい結果に置き換わります。貼り付けた文章はそのままです。</p>',
+      body: '<p>読み取り結果（原文）が新しい結果に置き換わります。手で直した文章と貼り付けた文章はそのままです。</p>',
       ok: '読み取る',
     }))) return;
     if (!(await ensureOcrReady(mode))) return;
     await ocr.enqueue(id);
     toast('読み取りを始めました。ほかの操作をしていて大丈夫です');
-  };
+  });
 
   // 裏の文字認識の進み具合を反映。入力中なら書きかけを壊さないよう、状態の表示と空欄だけ更新する
   onLeave(ocr.onOcrChange((p) => {
     if (p.id !== id) return;
-    Object.assign(page, { ocrStatus: p.ocrStatus, ocrText: p.ocrText, ocrError: p.ocrError, textSource: p.textSource });
+    Object.assign(page, { ocrStatus: p.ocrStatus, ocrText: p.ocrText, ocrError: p.ocrError, textSource: p.textSource, editedText: p.editedText });
     const typing = document.activeElement?.matches?.('#textCard textarea, #comment');
     if (!typing) return render(true);
     const chip = $('#ocrStatus');
-    if (chip) { chip.className = `ocr-chip st-${p.ocrStatus}`; chip.textContent = ocr.STATUS_LABEL[p.ocrStatus]; }
+    if (chip) { chip.className = `ocr-chip st-${p.ocrStatus}`; chip.textContent = statusLabel(p); }
     const ta = $('#ocrText');
     if (p.ocrStatus === 'done' && ta && document.activeElement !== ta) ta.value = p.ocrText || '';
   }));
@@ -701,6 +795,7 @@ async function viewSettings() {
 
   const ready = await ocr.readiness();
   const ocrAuto = await db.getSetting('ocrAuto', true);
+  const psmVertical = String(await db.getSetting('ocrPsmVertical', '5'));
 
   app.innerHTML = `
     <header class="hero small-hero"><h1>設定</h1></header>
@@ -715,6 +810,8 @@ async function viewSettings() {
       </ul>
       ${ready.engine ? '' : `<p class="muted tiny">初回は文字認識エンジン（約${ocr.ENGINE_MB}MB）も一緒にダウンロードします。</p>`}
       <label class="toggle"><input type="checkbox" id="ocrAuto" ${ocrAuto ? 'checked' : ''}> 写真を追加したら、自動で読み取る</label>
+      <label class="field"><span class="label">縦書きのページの読み方</span>
+        <select id="ocrPsm">${Object.entries(ocr.PSM_OPTIONS).map(([v, l]) => `<option value="${v}" ${v === psmVertical ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
     </section>
 
     <section class="card">
@@ -731,13 +828,14 @@ async function viewSettings() {
 
   for (const b of $$('[data-dl]')) b.onclick = async () => { if (await ensureOcrReady(b.dataset.dl)) render(true); };
   $('#ocrAuto').onchange = (e) => db.setSetting('ocrAuto', e.target.checked);
+  $('#ocrPsm').onchange = async (e) => { await db.setSetting('ocrPsmVertical', e.target.value); toast('次の読み取りから使います'); };
 
   $('#exportBtn').onclick = async () => {
     toast('書き出しています…');
     const [books, tags, pages] = await Promise.all([db.getAll('books'), db.getAll('tags'), db.getAll('pages')]);
     const data = {
       app: 'hon-shiori', version: 1, exportedAt: Date.now(), books, tags,
-      pages: await Promise.all(pages.map(async (p) => ({ ...p, image: await blobToDataURL(p.image), thumb: await blobToDataURL(p.thumb) }))),
+      pages: await Promise.all(pages.map(async (p) => ({ ...p, image: p.image ? await blobToDataURL(p.image) : null, thumb: p.thumb ? await blobToDataURL(p.thumb) : null }))),
     };
     const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
     const a = document.createElement('a');
@@ -758,7 +856,7 @@ async function viewSettings() {
       for (const b of data.books) await db.put('books', b);
       for (const t of data.tags) await db.put('tags', t);
       for (const p of data.pages) {
-        await db.put('pages', { ...p, image: await dataURLToBlob(p.image), thumb: await dataURLToBlob(p.thumb) });
+        await db.put('pages', { ...p, image: p.image ? await dataURLToBlob(p.image) : null, thumb: p.thumb ? await dataURLToBlob(p.thumb) : null });
       }
       toast('読み込みました');
       go('#/');
@@ -818,9 +916,8 @@ async function viewShare(shareId) {
     if (!grid) return;
     const pages = bookId && bookId !== '__new' ? await db.pagesOfBook(bookId) : [];
     pickedPage = '';
-    grid.innerHTML = pages.length
-      ? pages.map((p) => `<button type="button" class="pick-card" data-pick="${p.id}"><img src="${blobUrl(p.thumb)}" alt="">${p.pasteText?.trim() ? '<span class="tiny">貼り付け済み</span>' : ''}</button>`).join('')
-      : '<p class="muted small">この本にはまだページがありません。先に写真を追加してください。</p>';
+    grid.innerHTML = `<button type="button" class="pick-card new-page" data-pick="__new"><span>＋<br>新しいページ<br><small>（写真なし）</small></span></button>`
+      + pages.map((p) => `<button type="button" class="pick-card" data-pick="${p.id}">${p.thumb ? `<img src="${blobUrl(p.thumb)}" alt="">` : `<span class="pick-text">${esc(ocr.adoptedText(p).text.slice(0, 30))}</span>`}${p.pasteText?.trim() ? '<span class="tiny">貼り付け済み</span>' : ''}</button>`).join('');
     for (const b of $$('[data-pick]', grid)) {
       b.onclick = () => {
         pickedPage = b.dataset.pick;
@@ -860,7 +957,9 @@ async function viewShare(shareId) {
       if (toFirst && ids[0]) await db.update('pages', ids[0], { textSource: 'paste' });
       if (ids.length === 1) target = '#/page/' + ids[0];
     }
-    if (t && !toFirst) {
+    if (t && !toFirst && pickedPage === '__new') {
+      target = '#/page/' + (await addTextPage(bookId, t));
+    } else if (t && !toFirst) {
       await db.update('pages', pickedPage, (cur) => ({
         pasteText: cur.pasteText?.trim() ? cur.pasteText.replace(/\s*$/, '\n') + t : t,
         textSource: cur.textSource || 'paste',

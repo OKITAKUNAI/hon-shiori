@@ -4,6 +4,7 @@ import { resizeImage, imageSize, esc, THUMB_W, THUMB_H, THUMB_VERSION } from './
 import { makeThumb, regenerateThumbs } from './thumbs.js';
 import * as ocr from './ocr.js';
 import * as share from './share.js';
+import { preprocessForOcr } from './preprocess.js';
 
 const TEST_DB = 'hon-shiori-test';
 const list = document.getElementById('results');
@@ -77,6 +78,23 @@ function drawHorizontal(w = 1200, h = 900) {
   return c;
 }
 
+
+// JPEG に EXIF の向き（Orientation）を書き込む。カメラが横向きのまま保存し、向きの情報だけ付けた写真を再現する
+async function withExifOrientation(jpegBlob, orientation) {
+  const src = new Uint8Array(await jpegBlob.arrayBuffer());
+  const tiff = [0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, orientation, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00];
+  const body = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00, ...tiff]; // "Exif\0\0"
+  const len = body.length + 2;
+  const app1 = [0xff, 0xe1, len >> 8, len & 0xff, ...body];
+  const out = new Uint8Array(src.length + app1.length);
+  out.set(src.subarray(0, 2), 0);           // SOI
+  out.set(app1, 2);
+  out.set(src.subarray(2), 2 + app1.length);
+  return new Blob([out], { type: 'image/jpeg' });
+}
+
 // 2つの文章の一致率（最長共通部分列の長さから計算。空白と改行は無視）
 function similarity(a, b) {
   a = [...a.replace(/\s/g, '')];
@@ -121,7 +139,9 @@ function deleteDb(name) {
     const req = indexedDB.deleteDatabase(name);
     req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
-    req.onblocked = () => reject(new Error(`${name} を消せません（他のタブで開いています）`));
+    // 閉じたばかりの接続が残っていると一時的に blocked になるので、閉じ終わって消えるまで待つ
+    const t = setTimeout(() => reject(new Error(`${name} を消せません（他のタブで開いています）`)), 5000);
+    req.onsuccess = () => { clearTimeout(t); resolve(); };
   });
 }
 
@@ -301,7 +321,7 @@ async function run() {
     assert(ocrAvailable, '言語データを準備できなかったので実行しない');
     const blob = await toBlob(drawPage(1200, 1600), 'image/png');
     const t0 = performance.now();
-    const text = await ocr.recognize(blob, 'vertical');
+    const { text } = await ocr.recognize(blob, 'vertical', { psm: '5' });
     const want = SAMPLE.join('');
     const score = similarity(text, want);
     assert(score >= 0.8, `一致率 ${(score * 100).toFixed(0)}%：${text}`);
@@ -311,7 +331,7 @@ async function run() {
   await test('canvas に描いた横書きの見本文を読み取れる（一致率80%以上）', async () => {
     await ocr.prepare('horizontal');
     const blob = await toBlob(drawHorizontal(1200, 900), 'image/png');
-    const text = await ocr.recognize(blob, 'horizontal');
+    const { text } = await ocr.recognize(blob, 'horizontal');
     const score = similarity(text, SAMPLE.join(''));
     assert(score >= 0.8, `一致率 ${(score * 100).toFixed(0)}%：${text}`);
     return `一致率 ${(score * 100).toFixed(0)}%：${text}`;
@@ -351,7 +371,8 @@ async function run() {
     const p = await db.get('pages', 'q1');
     assert(p.ocrStatus === 'done', `状態 ${p.ocrStatus} ${p.ocrError || ''}`);
     assert(similarity(p.ocrText, SAMPLE.join('')) >= 0.8, `結果：${p.ocrText}`);
-    assert(p.textSource === 'ocr' && p.ocrMode === 'vertical', `textSource=${p.textSource} ocrMode=${p.ocrMode}`);
+    assert(p.textSource === 'ocr' && p.ocrLang === 'jpn_vert' && p.ocrPsm === '5', `textSource=${p.textSource} ocrLang=${p.ocrLang} ocrPsm=${p.ocrPsm}`);
+    assert(p.editedText === undefined || p.editedText === '', '手で直した文章に書き込まれた');
     assert(seen.join(',') === 'queued,running,done', `状態の変化: ${seen.join(',')}`);
     return `状態の変化: ${seen.join(' → ')}`;
   });
@@ -376,6 +397,116 @@ async function run() {
     const p = await db.get('pages', 'q1');
     assert(p.textSource === 'paste' && ocr.adoptedText(p).text === 'レンズでコピーした文章', `textSource=${p.textSource}`);
     assert(p.ocrText.length > 10, '読み取り結果も保存されていない');
+  });
+
+
+  await test('縦書きの読み方 PSM 5 と PSM 3 を同じ見本で比べる', async () => {
+    const blob = await toBlob(drawPage(1200, 1600), 'image/png');
+    const want = SAMPLE.join('');
+    const rows = [];
+    for (const psm of ['5', '3']) {
+      const t0 = performance.now();
+      const r = await ocr.recognize(blob, 'vertical', { psm });
+      rows.push({ psm, score: similarity(r.text, want), ms: Math.round(performance.now() - t0), text: r.text });
+    }
+    document.getElementById('psmCompare').innerHTML = rows.map((r) => `
+      <tr><th>PSM ${r.psm}</th><td>${(r.score * 100).toFixed(0)}%</td><td>${r.ms}ms</td><td class="vt">${esc(r.text)}</td></tr>`).join('');
+    assert(rows.every((r) => r.text.length > 0), '結果が空のものがある');
+    return rows.map((r) => `PSM ${r.psm}: 一致率 ${(r.score * 100).toFixed(0)}%・${r.ms}ms`).join(' ／ ');
+  });
+
+  await test('前処理：グレースケールになり、薄い写真のコントラストが広がる', async () => {
+    const c = document.createElement('canvas');
+    c.width = 200; c.height = 100;
+    const g = c.getContext('2d');
+    g.fillStyle = 'rgb(150,140,120)'; g.fillRect(0, 0, 200, 100);   // 黄ばんだ紙
+    g.fillStyle = 'rgb(105,100,95)'; g.fillRect(40, 30, 120, 40);     // 薄い文字
+    const { blob, range } = await preprocessForOcr(await toBlob(c, 'image/png'));
+    const bmp = await createImageBitmap(blob);
+    const o = document.createElement('canvas');
+    o.width = bmp.width; o.height = bmp.height;
+    const og = o.getContext('2d');
+    og.drawImage(bmp, 0, 0);
+    const px = (x, y) => og.getImageData(x, y, 1, 1).data;
+    const paper = px(5, 5);
+    const ink = px(100, 50);
+    assert(paper[0] === paper[1] && paper[1] === paper[2], `グレーでない: ${paper}`);
+    assert(paper[0] > 240 && ink[0] < 15, `紙 ${paper[0]}・文字 ${ink[0]}（広がっていない）`);
+    return `元の明るさ ${range.lo}〜${range.hi} → 紙 ${paper[0]}・文字 ${ink[0]}`;
+  });
+
+  await test('写真の向き（EXIF）が反映される：横向きに保存された縦写真が縦になる', async () => {
+    const c = document.createElement('canvas');
+    c.width = 400; c.height = 300;  // センサーの向きのまま保存された画像
+    c.getContext('2d').fillRect(0, 0, 100, 300);
+    const jpeg = await withExifOrientation(await toBlob(c), 6); // 6 = 時計回りに90度回して見る
+    const resized = await imageSize(await resizeImage(jpeg, 1568));
+    const pre = await imageSize((await preprocessForOcr(jpeg)).blob);
+    assert(resized.width === 300 && resized.height === 400, `保存用 ${resized.width}×${resized.height}`);
+    assert(pre.width === 300 && pre.height === 400, `認識用 ${pre.width}×${pre.height}`);
+    return '保存用・認識用とも 300×400（向きを反映。補正処理は不要）';
+  });
+
+  await test('文字認識で外部のサイトに通信していない（エンジンも言語データも同じサイトから）', async () => {
+    const external = performance.getEntriesByType('resource').map((e) => e.name).filter((u) => !u.startsWith(location.origin) && !u.startsWith('blob:') && !u.startsWith('data:'));
+    assert(external.length === 0, `外部への通信: ${external.join(', ')}`);
+    const sw = await (await fetch('sw.js')).text();
+    const shell = sw.slice(sw.indexOf('const SHELL'), sw.indexOf('];', sw.indexOf('const SHELL')));
+    assert(!/traineddata|vendor/.test(shell), 'Service Worker のインストール時に言語データを取得している');
+    // 言語データはワーカーの中で取得するのでこの画面の記録には出ない（サーバーの記録で確認）
+    return '画面からの通信はすべて同じサイト。インストール時に言語データは取得しない';
+  });
+
+  await test('写真のないページは読み取りの順番待ちに入らない', async () => {
+    const now = Date.now();
+    await db.put('pages', { id: 't1', bookId: 'b1', image: null, thumb: null, comment: '', tagIds: [], ocrStatus: 'none', ocrText: '', editedText: '', pasteText: '文章だけ', textSource: 'paste', createdAt: now, updatedAt: now });
+    await ocr.enqueue('t1');
+    const p = await db.get('pages', 't1');
+    assert(p.ocrStatus === 'none', `状態 ${p.ocrStatus}`);
+    assert(ocr.adoptedText(p).text === '文章だけ', '採用中の文章が違う');
+  });
+
+  await test('読み取りの進捗率が通知され、もう一度読み取っても手で直した文章は上書きしない', async () => {
+    await db.update('pages', 'q1', { editedText: '手で直した文章', ocrText: '古い原文', textSource: 'ocr' });
+    const progress = [];
+    const offP = ocr.onOcrProgress((pid, v) => { if (pid === 'q1') progress.push(v); });
+    const done = new Promise((res) => {
+      const off = ocr.onOcrChange((p) => { if (p.id === 'q1' && p.ocrStatus === 'done') { off(); res(); } });
+    });
+    await ocr.enqueue('q1');
+    await done;
+    offP();
+    const p = await db.get('pages', 'q1');
+    assert(p.editedText === '手で直した文章', `editedText が ${p.editedText}`);
+    assert(p.ocrText !== '古い原文' && similarity(p.ocrText, SAMPLE.join('')) >= 0.8, '原文が更新されていない');
+    assert(ocr.adoptedText(p).text === '手で直した文章', '画面に出す文章が手直しになっていない');
+    assert(progress.length >= 2 && Math.max(...progress) > 0.5, `進捗の通知: ${progress.length}回 最大${Math.max(0, ...progress)}`);
+    return `進捗の通知 ${progress.length} 回（最大 ${Math.round(Math.max(...progress) * 100)}%）`;
+  });
+
+  await test('読み取り中にキャンセルでき、そのあともワーカーを作り直して読み取れる', async () => {
+    const big = await toBlob(drawPage(1568, 2090));
+    const now = Date.now();
+    await db.put('pages', { id: 'c1', bookId: 'b1', image: big, thumb: big, comment: '', tagIds: [], ocrStatus: 'none', ocrText: '', editedText: '', pasteText: '', textSource: null, createdAt: now + 100, updatedAt: now });
+    const running = new Promise((res) => {
+      const off = ocr.onOcrProgress((pid) => { if (pid === 'c1') { off(); res(); } });
+    });
+    await ocr.enqueue('c1');
+    await running;
+    const t0 = performance.now();
+    await ocr.cancel('c1');
+    const cancelMs = Math.round(performance.now() - t0);
+    await new Promise((r) => setTimeout(r, 300));
+    let p = await db.get('pages', 'c1');
+    assert(p.ocrStatus === 'none' && !p.ocrText, `キャンセル後の状態 ${p.ocrStatus}`);
+    const done = new Promise((res) => {
+      const off = ocr.onOcrChange((q) => { if (q.id === 'c1' && (q.ocrStatus === 'done' || q.ocrStatus === 'failed')) { off(); res(); } });
+    });
+    await ocr.enqueue('c1');
+    await done;
+    p = await db.get('pages', 'c1');
+    assert(p.ocrStatus === 'done' && p.ocrText.length > 10, `再実行の状態 ${p.ocrStatus} ${p.ocrError || ''}`);
+    return `キャンセルにかかった時間 ${cancelMs}ms`;
   });
 
   // ---- 共有の受け取り ----

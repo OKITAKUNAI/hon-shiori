@@ -5,14 +5,15 @@ const IS_BETA =
   /-beta(\/|$)/.test(self.location.pathname) ||
   ['localhost', '127.0.0.1', '[::1]'].includes(self.location.hostname);
 const PREFIX = IS_BETA ? 'hon-shiori-beta-' : 'hon-shiori-';
-const CACHE = PREFIX + 'v4';
-// 文字認識のエンジン（vendor/tesseract）と言語データ。どちらもバージョン固定なので、
-// アプリ本体を更新しても消さずに使い続ける（数MBあるため、毎回取り直さない）
+const CACHE = PREFIX + 'v5';
+// 文字認識のエンジンと言語データ（どちらも vendor/ に同梱）。フォルダ名にバージョンが入っていて中身が変わらないので、
+// アプリ本体を更新しても消さずに使い続ける（数MBあるため、毎回取り直さない）。
+// インストール時にまとめて取得はせず、使う向きの分だけ初回の認識の前に取得したものを保存する
 const LANG_CACHE = PREFIX + 'ocr-data';
 const SHARE_CACHE = PREFIX + 'share';     // 共有で受け取った内容の一時保管（share.js と同じ名前）
 const KEEP = [CACHE, LANG_CACHE, SHARE_CACHE];
 const SHELL = [
-  './', 'index.html', 'style.css', 'app.js', 'config.js', 'db.js', 'util.js', 'thumbs.js', 'ocr.js', 'share.js',
+  './', 'index.html', 'style.css', 'app.js', 'config.js', 'db.js', 'util.js', 'thumbs.js', 'ocr.js', 'preprocess.js', 'share.js',
   IS_BETA ? 'manifest-beta.json' : 'manifest.json', 'icon-192.png', 'icon-512.png',
 ];
 const APP_ROOT = new URL('./', self.location).pathname;
@@ -53,9 +54,7 @@ async function receiveShare(request) {
   return Response.redirect(new URL(`./#/share/${id}`, self.location).href, 303);
 }
 
-const isLangData = (url) =>
-  (url.hostname === 'cdn.jsdelivr.net' && url.pathname.startsWith('/npm/@tesseract.js-data/')) ||
-  (url.origin === location.origin && url.pathname.startsWith(APP_ROOT + 'vendor/tesseract-'));
+const isLangData = (url) => url.origin === location.origin && url.pathname.startsWith(APP_ROOT + 'vendor/');
 
 self.addEventListener('fetch', (e) => {
   const req = e.request;
@@ -84,8 +83,10 @@ self.addEventListener('fetch', (e) => {
   const sameApp = url.origin === location.origin && url.pathname.startsWith(APP_ROOT);
   const cacheable = sameApp || url.hostname.endsWith('fonts.googleapis.com') || url.hostname.endsWith('fonts.gstatic.com');
   if (!cacheable) return;
+  // ブラウザのHTTPキャッシュ（GitHub Pages は10分）に古い版が残っていても、毎回サーバーに更新を確かめる
+  const fresh = req.mode === 'navigate' ? fetch(req) : fetch(req, { cache: 'no-cache' });
   e.respondWith(
-    fetch(req)
+    fresh
       .then((res) => {
         if (res.ok) {
           const copy = res.clone();
