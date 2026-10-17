@@ -5,7 +5,7 @@ const IS_BETA =
   /-beta(\/|$)/.test(self.location.pathname) ||
   ['localhost', '127.0.0.1', '[::1]'].includes(self.location.hostname);
 const PREFIX = IS_BETA ? 'hon-shiori-beta-' : 'hon-shiori-';
-const CACHE = PREFIX + 'v7';
+const CACHE = PREFIX + 'v8';
 // 文字認識のエンジンと言語データ（どちらも vendor/ に同梱）。フォルダ名にバージョンが入っていて中身が変わらないので、
 // アプリ本体を更新しても消さずに使い続ける（数MBあるため、毎回取り直さない）。
 // インストール時にまとめて取得はせず、使う向きの分だけ初回の認識の前に取得したものを保存する
@@ -89,7 +89,8 @@ self.addEventListener('fetch', (e) => {
   e.respondWith(
     fresh
       .then((res) => {
-        if (res.ok) {
+        // Google Fonts の CSS は中身の見えない応答（opaque）で返るが、電波がないときの見た目のために保存する
+        if (res.ok || (res.type === 'opaque' && url.hostname.endsWith('fonts.googleapis.com'))) {
           const copy = res.clone();
           caches.open(CACHE).then((c) => c.put(req, copy));
         }
