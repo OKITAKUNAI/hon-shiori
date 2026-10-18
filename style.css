@@ -419,6 +419,9 @@ dialog.viewer .zoom-frame img { height: 100%; }
 /* ---- 読み取りの自信が低い文字の印（薄い点線） ---- */
 .textview span.low { text-decoration: underline dotted rgba(214, 120, 30, 0.75); text-decoration-thickness: 2px; text-underline-offset: 0.18em; }
 .low-sample { text-decoration: underline dotted rgba(214, 120, 30, 0.85); text-decoration-thickness: 2px; }
+/* 読み取りのあとに自動で直した文字（自信の低い文字とは別の色・線） */
+.textview span.fix { text-decoration: underline wavy rgba(60, 110, 210, 0.8); text-decoration-thickness: 1.5px; text-underline-offset: 0.18em; }
+.fix-sample { text-decoration: underline wavy rgba(60, 110, 210, 0.85); text-decoration-thickness: 1.5px; }
 .ocr-time { margin-top: 2px; }
 .hl-wrap { position: relative; flex: 1; display: flex; min-height: 140px; }
 .hl-wrap #editText { position: relative; z-index: 1; background: transparent; flex: 1; }
@@ -427,3 +430,4 @@ dialog.viewer .zoom-frame img { height: 100%; }
   color: transparent; background: #fffdfa; border: solid transparent; border-radius: 12px; pointer-events: none;
 }
 .hl-backdrop mark { color: transparent; background: rgba(245, 170, 60, 0.28); border-bottom: 2px dotted rgba(214, 120, 30, 0.8); border-radius: 2px; }
+.hl-backdrop mark.fix { background: rgba(80, 140, 230, 0.22); border-bottom: 2px solid rgba(60, 110, 210, 0.75); }

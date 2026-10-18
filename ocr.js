@@ -6,6 +6,7 @@ import * as db from './db.js';
 import { APP_ID } from './config.js';
 import { preprocessForOcr } from './preprocess.js';
 import { updatePageText } from './marks.js';
+import { MON_TO_MA, MON_KEEP_NEXT } from './fix-words.js';
 export { sourceOf, sourceText, adoptedText, editedOf } from './text.js';
 
 // フォルダ名にバージョンを入れている。sw.js は vendor/ を「中身が変わらないもの」として長くキャッシュするので、
@@ -125,7 +126,8 @@ let cancelCurrent = null;
 
 // 写真を前処理してから読み取る。
 // pre：前処理の指定（preprocess.js の options。省くとコントラスト調整だけ）。psm：ページ分割モードを指定（比較用）
-// 戻り値：{ text, low（信頼度が99未満の文字：[位置, 信頼度]）, lang, psm, pre, time（かかった時間 ms） }
+// 戻り値：{ text, raw（自動修正の前の文章）, low（信頼度が99未満の文字：[text の中の位置, 信頼度]）,
+//          fixed（自動で直した文字：[text の中の位置, 元の文字]）, rawMap（raw の位置 → text の位置。縦書きのときだけ）, lang, psm, pre, time（かかった時間 ms） }
 export async function recognize(blob, mode, { onProgress, psm, pre = {} } = {}) {
   const t0 = performance.now();
   const w = await getWorker(mode, onProgress);
@@ -143,11 +145,24 @@ export async function recognize(blob, mode, { onProgress, psm, pre = {} } = {}) 
     job.catch(() => {}); // キャンセルでワーカーを止めたとき、取り残された読み取りの失敗は無視する
     const { data } = await Promise.race([job, cancelled]);
     const t3 = performance.now();
-    let text = cleanText(data.text || '');
-    const low = lowConfidence(text, symbolsOf(data));
-    if (mode === 'vertical') text = fixVerticalBars(text);
+    const raw = cleanText(data.text || '');
+    const symbols = symbolsOf(data);
+    const symAt = alignSymbols(raw, symbols);
+    let text = raw;
+    let low = lowConfidence(raw, symbols, symAt);
+    let fixed = [];
+    let rawMap = null;
+    let bars = [];
+    if (mode === 'vertical') {
+      const f = fixVertical(raw, { symbols, symAt });
+      text = f.text;
+      fixed = f.fixed;
+      rawMap = f.map;
+      bars = f.bars;
+      low = low.map(([i, c]) => [f.map[i], c]).filter(([i]) => i >= 0);
+    }
     return {
-      text, low, lang: MODES[mode].lang, psm: workerPsm, pre: info,
+      text, raw, rawMap, bars, low, fixed, lang: MODES[mode].lang, psm: workerPsm, pre: info,
       time: { total: Math.round(t3 - t0), load: Math.round(t1 - t0), pre: Math.round(t2 - t1), ocr: Math.round(t3 - t2) },
     };
   } finally {
@@ -158,38 +173,124 @@ export async function recognize(blob, mode, { onProgress, psm, pre = {} } = {}) 
 
 // ---------- 結果の整形 ----------
 
-// 縦書きで読み取った縦棒「|」は、直前がカタカナなら長音「ー」、それ以外は漢数字の「一」に置き換える
-export function fixVerticalBars(text) {
-  // カタカナ：U+30A0〜U+30FF（長音「ー」を含む）と半角カタカナ U+FF66〜U+FF9F。
-  // 縦棒が続くとき（「ア||」）は、置き換えたあとの直前の文字（ー）を見るので「アーー」になる
+// ---------- 読み取り後の自動修正（縦書きのとき） ----------
+//
+// 縦書きの読み取りでよく出る、日本語の文章にあるはずのない字を直す。普通に使う字（「入」「ほ」など）は直さない。
+//   縦棒「|」：字2つ分ほどの長さ（字の大きさの1.6倍以上）ならダッシュ「——」。
+//              短ければ、直前がカタカナなら長音「ー」、それ以外は漢数字の「一」
+//   「,」→「、」、「.」→「。」：英数字の間（「1,000」「3.14」「J.S.」）と、カタカナの間の「.」（中黒「・」の読み違い）は直さない。
+//              「.」が続くとき（「...」）も直さない
+//   「"」→「。」：縦書きの句点（字の右上の小さな丸）が白黒にしたときに2つに割れ、「"」と読まれたもの。
+//              句点の位置と言えるときだけ直す（下の isPeriodQuote）
+//   「〇問」→「〇間」：fix-words.js の一覧にある、日本語にない組み合わせだけ
+// 戻り値：{ text, map（元の文章の位置 → 直した文章の位置。消えた文字は -1）, fixed（[直した文章の位置, 元の文字]）,
+//          bars（縦棒の長さが字の大きさの何倍だったか。確認用） }
+const KANA_KANJI = /[ぁ-ゖゝゞァ-ヺー-ヾ々〆一-鿿㐀-䶿豈-﫿]/;
+const KATAKANA = /[゠-ヿｦ-ﾟ]/;
+const ASCII_ALNUM = /[A-Za-z0-9]/;
+const BAR = /[|｜]/;
+const SPACE = /[ \t　]/;
+// 句点の後に来られる字：かな・漢字・閉じかっこ（「。」」）・開きかっこ（次の文）・改行・文章の終わり
+const AFTER_PERIOD = /[ぁ-ゖァ-ヺー々一-鿿㐀-䶿豈-﫿」』）〕】〟「『（\n]/;
+export const DASH_RATIO = 1.6;
+
+// 「"」を句点にしてよいか。ほかの使い方（「〟」のような引用の印・同じ記号の意味の〃・英文の中）と区別する。
+//   前：かなか漢字であること（文の終わり）。句読点・かっこ・英数字・文章の始まりの直後は句点にならない
+//   後：かな・漢字・かっこ・改行・終わりであること（Tesseract が記号の後に入れる空白は飛ばして見る）。
+//       句読点や英数字、別の記号が続くなら句点ではない
+//   近く（前後30字）に別の「"」があれば、引用の印の組とみなして直さない
+export function isPeriodQuote(text, i) {
+  const prev = text[i - 1] || '';
+  const next = nextVisible(text, i);
+  if (!KANA_KANJI.test(prev)) return false;
+  if (next !== undefined && !AFTER_PERIOD.test(next)) return false;
+  const near = text.slice(Math.max(0, i - 30), i) + text.slice(i + 1, i + 31);
+  return !near.includes('"');
+}
+
+// i より後ろで、空白（改行は含めない）でない最初の字
+function nextVisible(text, i) {
+  let j = i + 1;
+  while (j < text.length && SPACE.test(text[j])) j++;
+  return text[j];
+}
+
+// 字の大きさ（読み取った漢字・かなの縦横の長いほうの中央値）
+function glyphSize(symbols) {
+  const s = symbols.filter((x) => x.box && KANA_KANJI.test(x.text || '')).map((x) => Math.max(x.box.x1 - x.box.x0, x.box.y1 - x.box.y0)).sort((a, b) => a - b);
+  return s.length ? s[s.length >> 1] : 0;
+}
+
+function barLength(sym) {
+  return sym?.box ? Math.max(sym.box.x1 - sym.box.x0, sym.box.y1 - sym.box.y0) : 0;
+}
+
+export function fixVertical(text, { symbols = [], symAt = [] } = {}) {
+  const size = glyphSize(symbols);
+  const map = new Int32Array(text.length).fill(-1);
+  const fixed = [];
+  const bars = [];
   let out = '';
-  for (const ch of text) {
-    out += ch === '|' || ch === '｜' ? (/[゠-ヿｦ-ﾟ]/.test(out.at(-1) || '') ? 'ー' : '一') : ch;
+  const put = (i, s, from) => {
+    map[i] = out.length;
+    if (from !== undefined) for (let k = 0; k < s.length; k++) fixed.push([out.length + k, from]);
+    out += s;
+  };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const prev = out.at(-1) || '';
+    const next = nextVisible(text, i) || '';
+    if (BAR.test(ch)) {
+      const sym = symbols[symAt[i]];
+      const ratio = size && sym?.box ? barLength(sym) / size : 0;
+      bars.push(Math.round(ratio * 100) / 100);
+      if (ratio >= DASH_RATIO) put(i, '——', ch);
+      else put(i, KATAKANA.test(prev) ? 'ー' : '一', ch);
+    } else if (ch === ',' && KANA_KANJI.test(prev) && !ASCII_ALNUM.test(next)) {
+      put(i, '、', ch);
+    } else if (ch === '.' && KANA_KANJI.test(prev) && !ASCII_ALNUM.test(next) && next !== '.' && !(KATAKANA.test(prev) && KATAKANA.test(next))) {
+      put(i, '。', ch);
+    } else if (ch === '"' && isPeriodQuote(text, i)) {
+      put(i, '。', ch);
+    } else if (ch === '問' && MON_TO_MA.includes(prev + '問') && !MON_KEEP_NEXT.includes(next || '\0')) {
+      put(i, '間', ch);
+    } else if (SPACE.test(ch) && fixed.length && fixed.at(-1)[0] === out.length - 1 && KANA_KANJI.test(next)) {
+      // 直した字（「一」「——」など）と次の字の間に残った空白は除く（Tesseract は記号の後に空白を入れる）
+    } else {
+      put(i, ch);
+    }
   }
-  return out;
+  return { text: out, map, fixed, bars };
 }
 
 function symbolsOf(data) {
   const out = [];
-  for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) for (const w of l.words || []) for (const s of w.symbols || []) out.push({ text: s.text, conf: s.confidence });
+  for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) for (const w of l.words || []) for (const s of w.symbols || []) out.push({ text: s.text, conf: s.confidence, box: s.bbox });
   return out;
 }
 
-// 整形した文章の文字と、Tesseract の文字ごとの信頼度を対応づけ、信頼度が99未満の文字の位置を返す。
+// 整形した文章の各文字が、Tesseract のどの文字にあたるか（なければ -1）。
 // 整形は空白と改行を取り除くだけなので、空白以外の文字は Tesseract の文字と同じ順に並ぶ（念のため数文字先まで探して合わせる）
-export const LOW_CONF_KEEP = 99;
-export function lowConfidence(text, symbols) {
-  const low = [];
+export function alignSymbols(text, symbols) {
+  const at = new Int32Array(text.length).fill(-1);
   let k = 0;
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (/\s/.test(ch)) continue;
-    let found = -1;
-    for (let d = 0; d < 4 && k + d < symbols.length; d++) if ((symbols[k + d].text || '').startsWith(ch)) { found = k + d; break; }
-    if (found < 0) continue;
-    const c = symbols[found].conf;
-    if (c < LOW_CONF_KEEP) low.push([i, Math.round(c * 10) / 10]);
-    k = found + 1;
+    for (let d = 0; d < 4 && k + d < symbols.length; d++) {
+      if ((symbols[k + d].text || '').startsWith(ch)) { at[i] = k + d; k += d + 1; break; }
+    }
+  }
+  return at;
+}
+
+// 信頼度が99未満の文字の位置 [位置, 信頼度]
+export const LOW_CONF_KEEP = 99;
+export function lowConfidence(text, symbols, symAt = alignSymbols(text, symbols)) {
+  const low = [];
+  for (let i = 0; i < text.length; i++) {
+    const s = symbols[symAt[i]];
+    if (s && s.conf < LOW_CONF_KEEP) low.push([i, Math.round(s.conf * 10) / 10]);
   }
   return low;
 }
@@ -300,6 +401,7 @@ async function processQueue() {
           ocrPsm: r.psm,
           ocrPre: r.pre,             // 使った前処理（切り抜き・傾きの角度・二値化・除いたルビの数）
           ocrLow: r.low,             // 信頼度の低い文字 [ocrText の中の位置, 信頼度]
+          ocrFixed: r.fixed,         // 自動で直した文字 [ocrText の中の位置, 元の文字]
           ocrTime: r.time,           // かかった時間（ms）：合計・エンジンの準備・前処理・認識
           ocrAt: Date.now(),
           ocrError: '',

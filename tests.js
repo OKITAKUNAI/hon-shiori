@@ -10,8 +10,9 @@ import { drawRubyPage, RUBY_TRUTH, RUBY_STRINGS } from './tools/sample-page.js';
 import { makeAnchor, reanchor, isPlaced } from './anchor.js';
 import * as marksMod from './marks.js';
 import { renderText } from './textview.js';
+import { MON_TO_MA } from './fix-words.js';
 import { exportBackup, importBackup } from './backup.js';
-import { editedOf, lowConfIn, alignMap } from './text.js';
+import { editedOf, lowConfIn, autoFixedIn, alignMap } from './text.js';
 
 const TEST_DB = 'hon-shiori-test';
 const list = document.getElementById('results');
@@ -739,10 +740,93 @@ async function run() {
 
 
   // ---- 読み取りの自信が低い文字の印・縦棒の置き換え・かかった時間 ----
-  await test('縦書きの縦棒「|」は、直前がカタカナなら「ー」、それ以外は「一」にする', async () => {
-    const cases = [['ス|パ|', 'スーパー'], ['第|章', '第一章'], ['|つの道', '一つの道'], ['ア||', 'アーー'], ['ｶ|ﾄﾞ', 'ｶーﾄﾞ'], ['、|投', '、一投'], ['全角｜も', '全角一も']];
-    for (const [a, b] of cases) assert(ocr.fixVerticalBars(a) === b, `${a} → ${ocr.fixVerticalBars(a)}（期待 ${b}）`);
-    return cases.map(([a, b]) => `${a}→${b}`).join('　');
+  // 自動修正：文字の位置の情報なしで呼ぶと、縦棒はすべて短いものとして扱う
+  const fixText = (s) => ocr.fixVertical(s).text;
+  const checkCases = (cases) => {
+    for (const [a, b] of cases) assert(fixText(a) === b, `${a} → ${fixText(a)}（期待 ${b}）`);
+    return cases.map(([a, b]) => (a === b ? `${a}（そのまま）` : `${a}→${b}`)).join('　');
+  };
+
+  await test('自動修正：短い縦棒「|」は、直前がカタカナなら「ー」、それ以外は「一」にする', async () =>
+    checkCases([['ス|パ|', 'スーパー'], ['第|章', '第一章'], ['|つの道', '一つの道'], ['ア||', 'アーー'], ['ｶ|ﾄﾞ', 'ｶーﾄﾞ'], ['、|投', '、一投'], ['全角｜も', '全角一も']]));
+
+  await test('自動修正：縦棒は、字2つ分ほど（字の大きさの1.6倍以上）の長さなら「——」にし、後ろの空白を除く', async () => {
+    // 字の大きさ40の字が並ぶ縦書きの列。縦棒の長さだけを変える
+    const make = (barLen) => {
+      const raw = 'あって| 考え';
+      const box = (y, h) => ({ x0: 0, x1: 40, y0: y, y1: y + h });
+      const symbols = [
+        { text: 'あ', conf: 99, box: box(0, 40) }, { text: 'っ', conf: 99, box: box(45, 26) }, { text: 'て', conf: 99, box: box(80, 40) },
+        { text: '|', conf: 80, box: { x0: 18, x1: 22, y0: 125, y1: 125 + barLen } },
+        { text: '考', conf: 99, box: box(215, 40) }, { text: 'え', conf: 99, box: box(260, 40) },
+      ];
+      return ocr.fixVertical(raw, { symbols, symAt: ocr.alignSymbols(raw, symbols) });
+    };
+    const long = make(82);
+    const short = make(38);
+    const edge = make(63); // 1.6倍（64）に届かない
+    assert(long.text === 'あって——考え', long.text);
+    assert(short.text === 'あって一考え', short.text);
+    assert(edge.text === 'あって一考え', edge.text);
+    assert(JSON.stringify(long.fixed) === JSON.stringify([[3, '|'], [4, '|']]), JSON.stringify(long.fixed));
+    assert(long.map[4] === -1 && long.map[5] === 5, `位置の対応 ${[...long.map]}`);
+    return `長さ82→「——」・63→「一」・38→「一」`;
+  });
+
+  await test('自動修正：「,」は「、」、「.」は「。」にする（英数字の間・カタカナの間の「.」・「...」はそのまま）', async () =>
+    checkCases([
+      ['考え出された,ありうる', '考え出された、ありうる'], ['終わった.次の', '終わった。次の'], ['だろう.', 'だろう。'],
+      ['1,000円', '1,000円'], ['3.14の', '3.14の'], ['J.S.バッハ', 'J.S.バッハ'], ['アダム.スミス', 'アダム.スミス'],
+      ['そして...', 'そして...'], ['Hello, world', 'Hello, world'], ['、,', '、,'],
+    ]));
+
+  await test('自動修正：「"」は句点の位置のときだけ「。」にする（判断の基準）', async () =>
+    checkCases([
+      // 直す：前がかな・漢字で、後ろがかな・漢字・かっこ・改行・終わり
+      ['ならない"できる', 'ならない。できる'],
+      ['ならない" できる', 'ならない。できる'], // Tesseract が記号の後に入れた空白は飛ばして見て、除く
+      ['だろう"\n作家は', 'だろう。\n作家は'],
+      ['言った"」と', '言った。」と'],
+      ['終わり"', '終わり。'],
+      // 直さない：前が句読点・かっこ・英数字・文章の始まり
+      ['"始まり', '"始まり'], ['、"か', '、"か'], ['「"あ', '「"あ'], ['ABC"です', 'ABC"です'],
+      // 直さない：後ろが句読点・英数字・記号
+      ['あった"、', 'あった"、'], ['あった"。', 'あった"。'], ['あった"A', 'あった"A'], ['あった" A', 'あった" A'],
+      // 直さない：近く（前後30字）に別の「"」がある＝引用の印の組（〝自由〟を読み違えたもの）
+      ['彼は"自由"と言った', '彼は"自由"と言った'],
+    ]));
+
+  await test('自動修正：「人問」「時問」などの一覧の組み合わせだけを「間」に戻す（「質問」「学問」などは変えない）', async () => {
+    const r = checkCases([
+      ['ひとりの人問の物語', 'ひとりの人間の物語'], ['長い時問が', '長い時間が'], ['空問と瞬問', '空間と瞬間'],
+      ['世問・期問・中問・年問', '世間・期間・中間・年間'], ['仲問と民問の週問', '仲間と民間の週間'], ['夜問も昼問も', '夜間も昼間も'],
+      // 本当にある言葉は変えない
+      ['質問と学問と疑問と訪問', '質問と学問と疑問と訪問'], ['設問・難問・尋問・顧問・反問', '設問・難問・尋問・顧問・反問'],
+      // 一覧の2字でも、「問」の次の字で別の言葉とわかるものは変えない
+      ['昼夜問わず', '昼夜問わず'], ['2000年問題', '2000年問題'], ['当時問題になった', '当時問題になった'], ['本人問い合わせ', '本人問い合わせ'], ['毎年問われる', '毎年問われる'],
+      // 普通に使う字は直さない
+      ['入る・ほら・入間', '入る・ほら・入間'],
+    ]);
+    // 一覧に「〇問」の形でない言葉や、本当にある言葉が入っていないこと
+    const real = ['質問', '学問', '疑問', '訪問', '設問', '難問', '尋問', '顧問', '反問', '弔問', '審問', '拷問', '検問', '慰問', '詰問', '諮問', '愚問', '発問', '下問', '不問', '試問', '自問', '借問', '一問', '問問'];
+    assert(MON_TO_MA.every((w) => w.length === 2 && w[1] === '問' && !real.includes(w)), MON_TO_MA.join(','));
+    return r;
+  });
+
+  await test('自動修正：直した字の位置を記録し、信頼度の低い字とは別に印を付ける。手直しすると消える', async () => {
+    const raw = 'ひとりの人問の物語であって| 考え出された,ありうる';
+    const f = ocr.fixVertical(raw);
+    assert(f.text === 'ひとりの人間の物語であって一考え出された、ありうる', f.text);
+    assert(JSON.stringify(f.fixed) === JSON.stringify([[5, '問'], [13, '|'], [20, ',']]), JSON.stringify(f.fixed));
+    const page = { textSource: 'ocr', ocrText: f.text, ocrFixed: f.fixed, ocrLow: [[5, 60], [8, 90]], editedText: { ocr: '', paste: '' } };
+    assert([...autoFixedIn(page, f.text)].join(',') === '5,13,20', '直した字の印');
+    const el = document.createElement('div');
+    renderText(el, f.text, { vertical: true, low: lowConfIn(page, f.text, 98), fixed: autoFixedIn(page, f.text) });
+    assert(el.querySelector('span[data-i="5"]').className === 'fix' && el.querySelector('span[data-i="8"]').className === 'low', el.innerHTML.slice(0, 200));
+    const edited = f.text.replace('一考', '——考'); // 「一」を手で「——」に直した
+    const left = [...autoFixedIn(page, edited)];
+    assert(left.join(',') === '5,21', `手直し後 ${left}`);
+    assert(autoFixedIn({ ...page, textSource: 'paste', pasteText: 'x' }, 'x').size === 0, '貼り付けの文章に印が出た');
   });
 
   await test('Tesseract の文字ごとの信頼度を、整形した文章の位置に対応づける（空白・改行は飛ばす）', async () => {
@@ -781,6 +865,7 @@ async function run() {
     const tm = p.ocrTime;
     assert(tm && tm.total > 0 && tm.total >= tm.pre + tm.ocr && tm.ocr > 0, `ocrTime ${JSON.stringify(tm)}`);
     assert(!/[|｜]/.test(p.ocrText), '縦棒が残っている');
+    assert(Array.isArray(p.ocrFixed), 'ocrFixed がない');
     return `かかった時間 ${(tm.total / 1000).toFixed(1)}秒（準備 ${tm.load}ms・前処理 ${tm.pre}ms・認識 ${tm.ocr}ms）・信頼度の低い文字 ${p.ocrLow.length}字`;
   });
 

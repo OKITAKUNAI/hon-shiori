@@ -72,13 +72,22 @@ export function alignMap(a, b) {
   return map;
 }
 
-// 文章 text の中で、信頼度の低い文字の位置（Set）。読み取り結果（ocrText）から変わっていない文字だけに印を残す
-// （手直しした文字の印は消える）。貼り付けの文章を使っているときは印を出さない
-export function lowConfIn(page, text, threshold = LOW_CONF_DEFAULT) {
-  if (sourceOf(page) !== 'ocr' || !page.ocrLow?.length || !text) return new Set();
+// 読み取り結果（ocrText）の中の位置の一覧を、文章 text の中の位置（Set）に移す。
+// ocrText から変わっていない文字だけを残すので、手直しした文字の印は消える。貼り付けの文章を使っているときは何も出さない
+function keptIn(page, text, positions) {
+  if (sourceOf(page) !== 'ocr' || !positions.length || !text) return new Set();
   const raw = page.ocrText || '';
-  const lows = page.ocrLow.filter(([, c]) => c < threshold).map(([i]) => i);
-  if (text === raw) return new Set(lows);
+  if (text === raw) return new Set(positions);
   const map = alignMap(raw, text);
-  return new Set(lows.map((i) => map[i]).filter((i) => i >= 0));
+  return new Set(positions.map((i) => map[i]).filter((i) => i >= 0));
+}
+
+// 信頼度の低い文字の位置
+export function lowConfIn(page, text, threshold = LOW_CONF_DEFAULT) {
+  return keptIn(page, text, (page.ocrLow || []).filter(([, c]) => c < threshold).map(([i]) => i));
+}
+
+// 読み取りのあとに自動で直した文字の位置（ocr.js の fixVertical）
+export function autoFixedIn(page, text) {
+  return keptIn(page, text, (page.ocrFixed || []).map(([i]) => i));
 }

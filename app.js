@@ -9,7 +9,7 @@ import * as ocr from './ocr.js';
 import * as share from './share.js';
 import { renderText, makeZoomable } from './textview.js';
 import * as marksMod from './marks.js';
-import { editedOf, withEdited, lowConfIn, LOW_CONF_LEVELS, LOW_CONF_DEFAULT } from './text.js';
+import { editedOf, withEdited, lowConfIn, autoFixedIn, LOW_CONF_LEVELS, LOW_CONF_DEFAULT } from './text.js';
 import { exportBackup, importBackup, summarize } from './backup.js';
 import { suggestCrop } from './preprocess.js';
 
@@ -507,7 +507,8 @@ async function viewPage(id) {
   let pageMarks = await marksMod.marksOfPage(id);
   const lowLevel = Number(await db.getSetting('lowConfLevel', LOW_CONF_DEFAULT));
   const showTime = await db.getSetting('showOcrTime', true);
-  const lowCount = lowConfIn(page, shown.text, lowLevel).size;
+  const fixedSet = autoFixedIn(page, shown.text);
+  const lowCount = [...lowConfIn(page, shown.text, lowLevel)].filter((i) => !fixedSet.has(i)).length;
   const t = page.ocrTime;
 
   // 変えた項目だけを書き込む（裏で作り直したサムネなどを古い値で上書きしないため）
@@ -544,7 +545,7 @@ async function viewPage(id) {
       ${shown.text ? '<p class="tiny muted sel-hint">線を引くには、始まりの文字をタップしてから終わりの文字をタップします</p>' : ''}
       <div class="textview" id="textView"></div>
       <div id="lostMarks"></div>
-      ${shown.text ? `<p class="tiny muted text-meta">元の文章：${SOURCE_LABEL[shown.source]}${shown.edited ? '（手直しあり）' : ''}${lowCount ? `・<span class="low-sample">点線</span>は読み取りの自信が低い文字（${lowCount}字）` : ''}</p>` : ''}
+      ${shown.text ? `<p class="tiny muted text-meta">元の文章：${SOURCE_LABEL[shown.source]}${shown.edited ? '（手直しあり）' : ''}${lowCount ? `・<span class="low-sample">点線</span>は読み取りの自信が低い文字（${lowCount}字）` : ''}${fixedSet.size ? `・<span class="fix-sample">青い波線</span>は読み取りのあとに自動で直した文字（${fixedSet.size}字）` : ''}</p>` : ''}
       ${showTime && t && page.image ? `<p class="tiny muted ocr-time">読み取りにかかった時間：<b>${(t.total / 1000).toFixed(1)}秒</b>（エンジンの準備 ${(t.load / 1000).toFixed(1)}秒・前処理 ${(t.pre / 1000).toFixed(1)}秒・認識 ${(t.ocr / 1000).toFixed(1)}秒）${page.ocrPsm ? `・PSM ${page.ocrPsm}` : ''}</p>` : ''}
       <details class="sources" ${pageTextTab.has(id) ? 'open' : ''}>
         <summary>読み取り結果と貼り付け（原文）</summary>
@@ -610,7 +611,7 @@ async function viewPage(id) {
     const text = currentText();
     const placed = pageMarks.filter((m) => marksMod.isPlaced(m, text))
       .map((m) => ({ id: m.id, start: m.start, end: m.end, color: marksMod.colorHex(m.color) }));
-    renderText($('#textView'), text, { vertical: isVertical(), marks: placed, selection: sel.range, anchor: sel.anchor, low: lowConfIn(page, text, lowLevel) });
+    renderText($('#textView'), text, { vertical: isVertical(), marks: placed, selection: sel.range, anchor: sel.anchor, low: lowConfIn(page, text, lowLevel), fixed: autoFixedIn(page, text) });
     drawLost(text);
     drawSelBar();
   };
@@ -1003,13 +1004,14 @@ async function viewEdit(id) {
         <div class="hl-backdrop" id="editBackdrop" aria-hidden="true"></div>
         <textarea id="editText" spellcheck="false">${esc(shown.text)}</textarea>
       </div>
+      <p class="tiny muted" id="editLegend"></p>
     </div>`;
 
   if (page.image) makeZoomable($('#editPhoto'), $('#editPhoto img'));
 
   const ta = $('#editText');
   // 信頼度の低い文字の印：入力欄には色を付けられないので、同じ文字の並びを後ろの層に描き、印の部分だけ色を付ける。
-  // 手直しした文字の印は消える（読み取り結果から変わっていない文字にだけ残す）
+  // 自動で直した文字は別の色にする。どちらも手直しした文字の印は消える（読み取り結果から変わっていない文字にだけ残す）
   const lowLevel = Number(await db.getSetting('lowConfLevel', LOW_CONF_DEFAULT));
   const backdrop = $('#editBackdrop');
   const cs = getComputedStyle(ta);
@@ -1019,9 +1021,18 @@ async function viewEdit(id) {
     const scrollbar = ta.offsetWidth - ta.clientWidth - parseFloat(cs.borderLeftWidth) - parseFloat(cs.borderRightWidth);
     backdrop.style.paddingRight = `${parseFloat(cs.paddingRight) + Math.max(0, scrollbar)}px`;
     const low = lowConfIn(page, ta.value, lowLevel);
+    const fixed = autoFixedIn(page, ta.value);
     let html = '';
-    for (let i = 0; i < ta.value.length; i++) html += low.has(i) ? `<mark>${esc(ta.value[i])}</mark>` : esc(ta.value[i]);
+    for (let i = 0; i < ta.value.length; i++) {
+      const c = esc(ta.value[i]);
+      html += fixed.has(i) ? `<mark class="fix">${c}</mark>` : low.has(i) ? `<mark>${c}</mark>` : c;
+    }
     backdrop.innerHTML = html + '\n ';
+    const lowN = [...low].filter((i) => !fixed.has(i)).length;
+    $('#editLegend').innerHTML = [
+      lowN ? `<span class="low-sample">オレンジ</span>は読み取りの自信が低い文字（${lowN}字）` : '',
+      fixed.size ? `<span class="fix-sample">青</span>は自動で直した文字（${fixed.size}字）` : '',
+    ].filter(Boolean).join('・');
     backdrop.scrollTop = ta.scrollTop;
   };
   drawLow();
