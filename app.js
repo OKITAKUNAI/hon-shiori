@@ -1206,7 +1206,7 @@ async function viewSettings() {
         <select id="ocrPsm">${Object.entries(ocr.PSM_OPTIONS).map(([v, l]) => `<option value="${v}" ${v === psmVertical ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
       <label class="field"><span class="label">読み取りの自信が低い文字の印（点線）</span>
         <select id="lowConf">${Object.entries(LOW_CONF_LEVELS).map(([v, l]) => `<option value="${v}" ${v === lowLevel ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
-      <p class="muted tiny">多めにすると見落としが減り、正しい字にも印が付きやすくなります（p9 の写真では、誤り9か所のうち 少なめ6・ふつう7・多め8 か所に印が付き、正しい字への印は 4.0%・5.5%・7.4% でした）。</p>
+      <p class="muted tiny">少なめにすると正しい字への印が減り、そのぶん誤りの見落としが増えます（p9 の写真では、誤り9か所のうち 少なめ6・やや少なめ7・ふつう8 か所に印が付き、正しい字への印は 4.0%・5.5%・7.4% でした）。</p>
       <label class="toggle"><input type="checkbox" id="showOcrTime" ${showTime ? 'checked' : ''}> 読み取りにかかった時間をページに表示する</label>
       <h4 class="sub-h">読み取りの前処理</h4>
       <label class="toggle"><input type="checkbox" id="cropAfterShot" ${cropAfterShot ? 'checked' : ''}> 1枚撮ったら、読み取る範囲の画面を出す</label>
