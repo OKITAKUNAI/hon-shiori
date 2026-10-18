@@ -751,26 +751,38 @@ async function run() {
     checkCases([['ス|パ|', 'スーパー'], ['第|章', '第一章'], ['|つの道', '一つの道'], ['ア||', 'アーー'], ['ｶ|ﾄﾞ', 'ｶーﾄﾞ'], ['、|投', '、一投'], ['全角｜も', '全角一も']]));
 
   await test('自動修正：縦棒は、字2つ分ほど（字の大きさの1.6倍以上）の長さなら「——」にし、後ろの空白を除く', async () => {
-    // 字の大きさ40の字が並ぶ縦書きの列。縦棒の長さだけを変える
-    const make = (barLen) => {
-      const raw = 'あって| 考え';
-      const box = (y, h) => ({ x0: 0, x1: 40, y0: y, y1: y + h });
-      const symbols = [
-        { text: 'あ', conf: 99, box: box(0, 40) }, { text: 'っ', conf: 99, box: box(45, 26) }, { text: 'て', conf: 99, box: box(80, 40) },
-        { text: '|', conf: 80, box: { x0: 18, x1: 22, y0: 125, y1: 125 + barLen } },
-        { text: '考', conf: 99, box: box(215, 40) }, { text: 'え', conf: 99, box: box(260, 40) },
-      ];
-      return ocr.fixVertical(raw, { symbols, symAt: ocr.alignSymbols(raw, symbols) });
-    };
-    const long = make(82);
-    const short = make(38);
-    const edge = make(63); // 1.6倍（64）に届かない
+    const raw = 'あって| 考え';
+    const run = (ratio) => ocr.fixVertical(raw, { barRatio: new Map([[3, ratio]]) });
+    const long = run(2.05);
     assert(long.text === 'あって——考え', long.text);
-    assert(short.text === 'あって一考え', short.text);
-    assert(edge.text === 'あって一考え', edge.text);
+    assert(run(1.59).text === 'あって一考え', run(1.59).text);
+    assert(run(0.8).text === 'あって一考え', run(0.8).text);
+    assert(ocr.fixVertical('コ|ヒ|', { barRatio: new Map([[1, 0.9]]) }).text === 'コーヒー', '長音');
     assert(JSON.stringify(long.fixed) === JSON.stringify([[3, '|'], [4, '|']]), JSON.stringify(long.fixed));
     assert(long.map[4] === -1 && long.map[5] === 5, `位置の対応 ${[...long.map]}`);
-    return `長さ82→「——」・63→「一」・38→「一」`;
+    return '2.05倍→「——」・1.59倍→「一」・0.8倍→「一」';
+  });
+
+  await test('自動修正：縦棒の長さを前処理した画像の上で測る（見本：ダッシュ1本と「一」）', async () => {
+    // 字の大きさ40の縦書きの列を描き、長さ84の縦線（ダッシュ）と、短い縦線（長さ30）を置く
+    const c = new OffscreenCanvas(200, 400);
+    const g = c.getContext('2d');
+    g.fillStyle = '#fff'; g.fillRect(0, 0, 200, 400);
+    g.fillStyle = '#000';
+    g.fillRect(98, 100, 4, 84); // ダッシュ
+    g.fillRect(98, 260, 4, 30); // 短い線
+    g.fillRect(80, 20, 40, 40); // 字（大きさの目安）
+    const blob = await c.convertToBlob({ type: 'image/png' });
+    const raw = '字|字|';
+    const symbols = [
+      { text: '字', wtext: '字', wbox: { x0: 80, x1: 120, y0: 20, y1: 60 } },
+      { text: '|', wtext: '|', wbox: { x0: 97, x1: 103, y0: 130, y1: 150 } }, // 枠は線より短く出る（実際の Tesseract.js と同じ）
+      { text: '字', wtext: '字', wbox: { x0: 80, x1: 120, y0: 200, y1: 240 } },
+      { text: '|', wtext: '|', wbox: { x0: 97, x1: 103, y0: 268, y1: 282 } },
+    ];
+    const ratios = await ocr.measureBars(blob, raw, symbols, ocr.alignSymbols(raw, symbols));
+    assert(Math.abs(ratios.get(1) - 2.1) < 0.1 && Math.abs(ratios.get(3) - 0.75) < 0.1, JSON.stringify([...ratios]));
+    return `ダッシュ ${ratios.get(1)}倍・短い線 ${ratios.get(3)}倍`;
   });
 
   await test('自動修正：「,」は「、」、「.」は「。」にする（英数字の間・カタカナの間の「.」・「...」はそのまま）', async () =>

@@ -29,9 +29,27 @@ export function diff(a, b) {
 }
 
 const strip = (s) => s.replace(/\s/g, '');
+const SMALL_PUNCT = new Set([...'っゃゅょぁぃぅぇぉッャュョァィゥェォ、。・「」']);
+// 正しい文章の中の小書き文字・句読点のうち、読み取れたものの数（ルビの除去で消えていないかの確認用）
+function smallKept(got, truth) {
+  const d = diff(truth, got);
+  let hit = 0;
+  let total = 0;
+  [...truth].forEach((c, j) => { if (SMALL_PUNCT.has(c)) { total++; hit += d.matched[j]; } });
+  return `${hit}/${total}`;
+}
 
-export async function check(name, { size = 1568, pre = { crop: 'auto', deskew: true, binarize: 'sauvola', removeRuby: true } } = {}) {
-  const img = await (await fetch(`../private/${name}.jpg`, { cache: 'no-store' })).blob();
+// image：写真のファイル名（省くと name + '.jpg'）。clip：写真の一部だけを使うとき [x, y, 幅, 高さ]（画面の撮影から本の部分を切り出す用）
+async function clipImage(blob, [x, y, w, h]) {
+  const bmp = await createImageBitmap(blob);
+  const c = new OffscreenCanvas(w, h);
+  c.getContext('2d').drawImage(bmp, x, y, w, h, 0, 0, w, h);
+  return c.convertToBlob({ type: 'image/jpeg', quality: 0.95 });
+}
+
+export async function check(name, { image = `${name}.jpg`, clip = null, size = 1568, pre = { crop: 'auto', deskew: true, binarize: 'sauvola', removeRuby: true } } = {}) {
+  let img = await (await fetch(`../private/${image}`, { cache: 'no-store' })).blob();
+  if (clip) img = await clipImage(img, clip);
   const truth = strip(await (await fetch(`../private/${name}.txt`, { cache: 'no-store' })).text());
   const stored = await resizeImage(img, size);
   const r = await ocr.recognize(stored, 'vertical', { pre });
@@ -54,8 +72,8 @@ export async function check(name, { size = 1568, pre = { crop: 'auto', deskew: t
   });
   return {
     name,
-    before: { score: dB.score, errors: dB.places.length, places: dB.places },
-    after: { score: dA.score, errors: dA.places.length, places: dA.places },
+    before: { score: dB.score, errors: dB.places.length, places: dB.places, small: smallKept(before, truth) },
+    after: { score: dA.score, errors: dA.places.length, places: dA.places, small: smallKept(after, truth) },
     fixes,
     harmed: fixes.filter((x) => x.wasRight && !x.nowRight),
     helped: fixes.filter((x) => !x.wasRight && x.nowRight),

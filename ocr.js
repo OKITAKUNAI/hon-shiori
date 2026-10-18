@@ -154,7 +154,8 @@ export async function recognize(blob, mode, { onProgress, psm, pre = {} } = {}) 
     let rawMap = null;
     let bars = [];
     if (mode === 'vertical') {
-      const f = fixVertical(raw, { symbols, symAt });
+      const barRatio = /[|｜]/.test(raw) ? await measureBars(prepared, raw, symbols, symAt) : new Map();
+      const f = fixVertical(raw, { barRatio });
       text = f.text;
       fixed = f.fixed;
       rawMap = f.map;
@@ -176,7 +177,7 @@ export async function recognize(blob, mode, { onProgress, psm, pre = {} } = {}) 
 // ---------- 読み取り後の自動修正（縦書きのとき） ----------
 //
 // 縦書きの読み取りでよく出る、日本語の文章にあるはずのない字を直す。普通に使う字（「入」「ほ」など）は直さない。
-//   縦棒「|」：字2つ分ほどの長さ（字の大きさの1.6倍以上）ならダッシュ「——」。
+//   縦棒「|」：字2つ分ほどの長さ（字の大きさの1.6倍以上。measureBars で測る）ならダッシュ「——」。
 //              短ければ、直前がカタカナなら長音「ー」、それ以外は漢数字の「一」
 //   「,」→「、」、「.」→「。」：英数字の間（「1,000」「3.14」「J.S.」）と、カタカナの間の「.」（中黒「・」の読み違い）は直さない。
 //              「.」が続くとき（「...」）も直さない
@@ -215,18 +216,72 @@ function nextVisible(text, i) {
   return text[j];
 }
 
-// 字の大きさ（読み取った漢字・かなの縦横の長いほうの中央値）
-function glyphSize(symbols) {
-  const s = symbols.filter((x) => x.box && KANA_KANJI.test(x.text || '')).map((x) => Math.max(x.box.x1 - x.box.x0, x.box.y1 - x.box.y0)).sort((a, b) => a - b);
-  return s.length ? s[s.length >> 1] : 0;
+// 縦棒の長さを、前処理した画像の上で測る。戻り値：文章の中の縦棒の位置 → 長さが字の大きさの何倍か。
+// 縦書きでは Tesseract.js の字ごとの位置情報が使えない（横の位置が0で、縦の位置が列全体で同じ値になる）。
+// 語の位置は使えるが字の高さが縮んで出るので、語の位置は縦棒の場所を探すのにだけ使い、長さは画像の黒い部分で測る。
+//   ・縦棒だけでできた語（「|」）のときだけ測る（ほかの字と同じ語なら場所が特定できないので測らず、短いものとして扱う）
+//   ・語の枠の中心に一番近い黒い点から、つながった黒い部分（縦に2点までの切れ目はつなぐ）を調べ、その縦の長さを使う
+//   ・字の大きさは、漢字・かなの語の枠の幅（列の太さ）の中央値。細い線（幅が字の大きさの0.35倍以下）でなければ測らない
+export async function measureBars(blob, text, symbols, symAt) {
+  const out = new Map();
+  const widths = symbols.filter((s) => s.wbox && KANA_KANJI.test(s.text || '')).map((s) => s.wbox.x1 - s.wbox.x0).sort((a, b) => a - b);
+  const size = widths[widths.length >> 1];
+  if (!size) return out;
+  let img;
+  try {
+    const bmp = await createImageBitmap(blob);
+    const c = new OffscreenCanvas(bmp.width, bmp.height);
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(bmp, 0, 0);
+    img = ctx.getImageData(0, 0, bmp.width, bmp.height);
+  } catch {
+    return out; // 測れないときは短いものとして扱う
+  }
+  const { width: W, height: H, data } = img;
+  const dark = (x, y) => x >= 0 && y >= 0 && x < W && y < H && data[(y * W + x) * 4] < 128;
+  for (let i = 0; i < text.length; i++) {
+    if (!BAR.test(text[i])) continue;
+    const s = symbols[symAt[i]];
+    if (!s?.wbox || !/^[|｜]+$/.test(s.wtext || '')) continue;
+    const b = s.wbox;
+    const cx = (b.x0 + b.x1) >> 1;
+    const cy = (b.y0 + b.y1) >> 1;
+    // 枠の中心に一番近い黒い点
+    let seed = null;
+    for (let r = 0; r <= Math.ceil(size / 2) && !seed; r++) {
+      for (let dy = -r; dy <= r && !seed; dy++) for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) === r && dark(cx + dx, cy + dy)) { seed = [cx + dx, cy + dy]; break; }
+      }
+    }
+    if (!seed) continue;
+    // つながった黒い部分を調べる（字の大きさの4倍の範囲まで）
+    const x0 = seed[0] - size;
+    const x1 = seed[0] + size;
+    const y0 = seed[1] - size * 4;
+    const y1 = seed[1] + size * 4;
+    const seen = new Set();
+    const stack = [seed];
+    let minX = seed[0]; let maxX = seed[0]; let minY = seed[1]; let maxY = seed[1];
+    while (stack.length && seen.size < 20000) {
+      const [x, y] = stack.pop();
+      const k = y * W + x;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y;
+      for (let dy = -3; dy <= 3; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if ((dx || dy) && nx >= x0 && nx <= x1 && ny >= y0 && ny <= y1 && dark(nx, ny) && !seen.has(ny * W + nx)) stack.push([nx, ny]);
+      }
+    }
+    if (maxX - minX + 1 > size * 0.35) continue; // 細い線ではない（ほかの字とつながっている）
+    out.set(i, Math.round(((maxY - minY + 1) / size) * 100) / 100);
+  }
+  return out;
 }
 
-function barLength(sym) {
-  return sym?.box ? Math.max(sym.box.x1 - sym.box.x0, sym.box.y1 - sym.box.y0) : 0;
-}
-
-export function fixVertical(text, { symbols = [], symAt = [] } = {}) {
-  const size = glyphSize(symbols);
+// barRatio：文章の中の縦棒の位置 → 長さが字の大きさの何倍か（measureBars の結果。ない縦棒は短いものとして扱う）
+export function fixVertical(text, { barRatio = new Map() } = {}) {
   const map = new Int32Array(text.length).fill(-1);
   const fixed = [];
   const bars = [];
@@ -241,9 +296,8 @@ export function fixVertical(text, { symbols = [], symAt = [] } = {}) {
     const prev = out.at(-1) || '';
     const next = nextVisible(text, i) || '';
     if (BAR.test(ch)) {
-      const sym = symbols[symAt[i]];
-      const ratio = size && sym?.box ? barLength(sym) / size : 0;
-      bars.push(Math.round(ratio * 100) / 100);
+      const ratio = barRatio.get(i) || 0;
+      bars.push(ratio);
       if (ratio >= DASH_RATIO) put(i, '——', ch);
       else put(i, KATAKANA.test(prev) ? 'ー' : '一', ch);
     } else if (ch === ',' && KANA_KANJI.test(prev) && !ASCII_ALNUM.test(next)) {
@@ -265,7 +319,7 @@ export function fixVertical(text, { symbols = [], symAt = [] } = {}) {
 
 function symbolsOf(data) {
   const out = [];
-  for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) for (const w of l.words || []) for (const s of w.symbols || []) out.push({ text: s.text, conf: s.confidence, box: s.bbox });
+  for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) for (const w of l.words || []) for (const s of w.symbols || []) out.push({ text: s.text, conf: s.confidence, wbox: w.bbox, wtext: w.text });
   return out;
 }
 
