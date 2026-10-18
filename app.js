@@ -9,7 +9,7 @@ import * as ocr from './ocr.js';
 import * as share from './share.js';
 import { renderText, makeZoomable } from './textview.js';
 import * as marksMod from './marks.js';
-import { editedOf, withEdited, lowConfIn, autoFixedIn, LOW_CONF_LEVELS, LOW_CONF_DEFAULT } from './text.js';
+import { editedOf, withEdited, lowConfIn, autoFixedIn, ocrLooksBroken, LOW_CONF_LEVELS, LOW_CONF_DEFAULT } from './text.js';
 import { exportBackup, importBackup, summarize } from './backup.js';
 import { suggestCrop } from './preprocess.js';
 
@@ -410,6 +410,7 @@ async function viewBook(id) {
         <span class="ap-icon">📝</span><b>文章だけ</b>
       </button>
     </div>
+    <p class="tiny muted shoot-tip">📷 本を開いて手で押さえ、真上から撮ると読み取りやすくなります</p>
 
     ${pages.length ? `
       <p class="muted small hint-line">★がついたページが本棚の表紙になります</p>
@@ -545,6 +546,7 @@ async function viewPage(id) {
       ${shown.text ? '<p class="tiny muted sel-hint">線を引くには、始まりの文字をタップしてから終わりの文字をタップします</p>' : ''}
       <div class="textview" id="textView"></div>
       <div id="lostMarks"></div>
+      ${ocrNotice(page, shown)}
       ${shown.text ? `<p class="tiny muted text-meta">元の文章：${SOURCE_LABEL[shown.source]}${shown.edited ? '（手直しあり）' : ''}${lowCount ? `・<span class="low-sample">点線</span>は読み取りの自信が低い文字（${lowCount}字）` : ''}${fixedSet.size ? `・<span class="fix-sample">青い波線</span>は読み取りのあとに自動で直した文字（${fixedSet.size}字）` : ''}</p>` : ''}
       ${showTime && t && page.image ? `<p class="tiny muted ocr-time">読み取りにかかった時間：<b>${(t.total / 1000).toFixed(1)}秒</b>（エンジンの準備 ${(t.load / 1000).toFixed(1)}秒・前処理 ${(t.pre / 1000).toFixed(1)}秒・認識 ${(t.ocr / 1000).toFixed(1)}秒）${page.ocrPsm ? `・PSM ${page.ocrPsm}` : ''}</p>` : ''}
       <details class="sources" ${pageTextTab.has(id) ? 'open' : ''}>
@@ -560,7 +562,7 @@ async function viewPage(id) {
         ${status === 'queued' || status === 'running'
           ? '<button class="btn ghost small" id="ocrCancel">読み取りをやめる</button>'
           : `<button class="btn soft small" id="ocrRun">🔍 ${page.ocrText ? 'もう一度読み取る' : '文字を読み取る'}</button>`}
-        <a class="btn ghost small" href="#/page/${id}/crop">✂️ 読み取り範囲${page.ocrCrop ? '（指定あり）' : ''}</a>
+        <a class="btn ghost small" href="#/page/${id}/crop">✂️ 読み取り範囲${page.ocrCrop || typeof page.ocrRotate === 'number' ? '（指定あり）' : ''}</a>
       </div>` : ''}
       <div class="seg" role="tablist">
         <button type="button" role="tab" data-tab="ocr" class="${textTab === 'ocr' ? 'on' : ''}">読み取り結果${adopted === 'ocr' ? '<i>使用中</i>' : ''}</button>
@@ -893,11 +895,27 @@ async function viewPage(id) {
   };
 }
 
-// ---------- 読み取り範囲（四隅の指定） ----------
-// 写真そのものは切り抜かず、四隅の位置（0〜1 の割合）を ocrCrop に記録する。読み取るたびにその範囲を長方形に引き伸ばして使う
+// 読み取り結果の上に出す案内：本文の範囲が見つからなかった・読み取りが崩れているかもしれない
+function ocrNotice(page, shown) {
+  if (!page.image || page.ocrStatus !== 'done' || shown.source !== 'ocr') return '';
+  const missing = page.ocrPre?.cropFound === false && !page.ocrCrop;
+  const broken = ocrLooksBroken(page);
+  if (!missing && !broken) return '';
+  const msg = missing
+    ? '本文の範囲が見つからなかったため、写真全体を読み取りました。四隅を本文に合わせて読み直せます。'
+    : '読み取りが崩れているかもしれません。範囲と傾きを調整して読み直せます。';
+  return `<div class="ocr-notice"><p class="small">${msg}</p><a class="btn soft small" href="#/page/${page.id}/crop">✂️ 範囲と傾きを調整して読み直す</a></div>`;
+}
+
+// ---------- 読み取り範囲（四隅の指定・傾き） ----------
+// 写真そのものは切り抜かず、四隅の位置（0〜1 の割合）を ocrCrop に、傾き（度。右回りが正）を ocrRotate に記録する。
+// 読み取るたびに、写真をその角度だけ同じ大きさのまま回し、四隅の範囲を長方形に引き伸ばして使う（斜めから撮った台形のゆがみもここで直る）。
+// 傾きを動かしていなければ ocrRotate は null のままで、切り抜いたあとに自動の傾き補正をする
 
 let cropFromCapture = null; // 撮影の直後に開いたページ（決めずに離れても、自動の範囲で読み取りを始める）
 const FULL_QUAD = [[0, 0], [1, 0], [1, 1], [0, 1]];
+const INSET_QUAD = [[0.06, 0.06], [0.94, 0.06], [0.94, 0.94], [0.06, 0.94]];
+const ROTATE_MAX = 10;
 
 async function viewCrop(id) {
   const page = await db.get('pages', id);
@@ -907,44 +925,82 @@ async function viewCrop(id) {
   const fromCapture = cropFromCapture === id;
   cropFromCapture = null;
   let decided = false;
+  const hadSetting = !!page.ocrCrop || typeof page.ocrRotate === 'number';
 
   app.innerHTML = `
     <div class="topbar">
       <a href="#/page/${id}" class="back">‹ ${fromCapture ? 'あとで（自動の範囲で読む）' : 'ページに戻る'}</a>
     </div>
     <h2 class="crop-title">読み取る範囲</h2>
-    <p class="small muted">本文だけを囲むように、四隅の ● を動かしてください。柱・ページ番号・ページの外を外すと、読み取りの精度が上がります。</p>
+    <p class="small muted">本文だけを囲むように、四隅の ● を本文の角に合わせてください。斜めから撮った写真は、台形のまま角に合わせるとゆがみも直ります。柱・ページ番号・ページの外は外します。</p>
     <div class="crop-stage" id="cropStage">
       <img id="cropImg" src="${blobUrl(page.image)}" alt="ページの写真" draggable="false">
-      <svg class="crop-svg" viewBox="0 0 1 1" preserveAspectRatio="none"><polygon id="cropPoly" vector-effect="non-scaling-stroke"></polygon></svg>
+      <svg class="crop-svg" viewBox="0 0 1 1" preserveAspectRatio="none">
+        ${[1, 2, 3, 4, 5, 6, 7].map((i) => `<line class="crop-guide" x1="${i / 8}" y1="0" x2="${i / 8}" y2="1" vector-effect="non-scaling-stroke"></line>`).join('')}
+        <polygon id="cropPoly" vector-effect="non-scaling-stroke"></polygon>
+      </svg>
       ${[0, 1, 2, 3].map((i) => `<span class="crop-handle" data-h="${i}"></span>`).join('')}
     </div>
     <p class="tiny muted" id="cropNote">本文の範囲を推定しています…</p>
+    <div class="crop-rotate">
+      <label class="small" for="cropRotate">傾き <b id="cropRotateVal">0.0°</b></label>
+      <button type="button" class="btn ghost small" id="rotMinus" aria-label="左に0.1度">−</button>
+      <input type="range" id="cropRotate" min="${-ROTATE_MAX}" max="${ROTATE_MAX}" step="0.1" value="0">
+      <button type="button" class="btn ghost small" id="rotPlus" aria-label="右に0.1度">＋</button>
+    </div>
+    <p class="tiny muted">文字の列が縦の線とそろうように、写真を回して合わせます。</p>
     <div class="row">
       <button type="button" class="btn ghost small" id="cropAuto">自動で囲む</button>
       <button type="button" class="btn ghost small" id="cropFull">写真全体</button>
+      <button type="button" class="btn ghost small" id="rotZero">傾きを0°に</button>
     </div>
     <div class="row-end crop-actions">
-      ${page.ocrCrop ? '<button type="button" class="btn ghost" id="cropClear">指定をやめる</button>' : ''}
+      ${hadSetting ? '<button type="button" class="btn ghost" id="cropClear">指定をやめる</button>' : ''}
       <button type="button" class="btn primary" id="cropGo">この範囲で読み取る</button>
     </div>`;
 
   const stage = $('#cropStage');
+  const img = $('#cropImg');
   let quad = page.ocrCrop ? page.ocrCrop.map((p) => [...p]) : null;
+  let rotate = typeof page.ocrRotate === 'number' ? page.ocrRotate : null; // null：手で決めていない（自動の傾き補正）
+  const note = (msg, warn = false) => { const el = $('#cropNote'); el.textContent = msg; el.classList.toggle('warn', warn); };
   const draw = () => {
+    const deg = rotate || 0;
+    img.style.transform = deg ? `rotate(${deg}deg)` : '';
+    $('#cropRotate').value = String(deg);
+    $('#cropRotateVal').textContent = `${deg > 0 ? '右に' : deg < 0 ? '左に' : ''}${Math.abs(deg).toFixed(1)}°`;
     if (!quad) return;
     $('#cropPoly').setAttribute('points', quad.map(([x, y]) => `${x},${y}`).join(' '));
     $$('.crop-handle').forEach((el, i) => { el.style.left = `${quad[i][0] * 100}%`; el.style.top = `${quad[i][1] * 100}%`; });
   };
   const autoQuad = async () => {
-    $('#cropNote').textContent = '本文の範囲を推定しています…';
-    quad = await suggestCrop(page.image, mode === 'vertical');
-    $('#cropNote').textContent = '自動で推定した範囲です。ずれていたら ● を動かしてください。';
+    note('本文の範囲を推定しています…');
+    const s = await suggestCrop(page.image, mode === 'vertical');
+    if (s.found) {
+      quad = s.rect;
+      rotate = s.rotate;
+      note('自動で推定した範囲と傾きです。ずれていたら ● と傾きを動かしてください。');
+    } else {
+      // 写真全体を範囲にして黙って進めない
+      quad = INSET_QUAD.map((p) => [...p]);
+      note('範囲が見つかりませんでした。四隅の ● を動かして本文を囲んでください。', true);
+    }
     draw();
   };
-  if (quad) { $('#cropNote').textContent = '前に指定した範囲です。'; draw(); } else autoQuad();
+  if (quad || rotate !== null) {
+    quad ||= FULL_QUAD.map((p) => [...p]);
+    note('前に指定した範囲と傾きです。');
+    draw();
+  } else autoQuad();
 
-  // ● をドラッグして動かす
+  // 傾き
+  const setRotate = (v) => { rotate = Math.round(Math.max(-ROTATE_MAX, Math.min(ROTATE_MAX, v)) * 10) / 10; draw(); };
+  $('#cropRotate').addEventListener('input', (e) => setRotate(Number(e.target.value)));
+  $('#rotMinus').onclick = () => setRotate((rotate || 0) - 0.1);
+  $('#rotPlus').onclick = () => setRotate((rotate || 0) + 0.1);
+  $('#rotZero').onclick = () => setRotate(0);
+
+  // ● をドラッグして動かす。位置は写真の枠（回す前の写真と同じ大きさ）の中の割合
   let drag = -1;
   stage.addEventListener('pointerdown', (e) => {
     const h = e.target.closest('.crop-handle');
@@ -955,7 +1011,7 @@ async function viewCrop(id) {
   });
   stage.addEventListener('pointermove', (e) => {
     if (drag < 0 || !quad) return;
-    const r = $('#cropImg').getBoundingClientRect();
+    const r = stage.getBoundingClientRect();
     quad[drag] = [Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))];
     draw();
   });
@@ -964,16 +1020,16 @@ async function viewCrop(id) {
   stage.addEventListener('pointercancel', endDrag);
 
   $('#cropAuto').onclick = autoQuad;
-  $('#cropFull').onclick = () => { quad = FULL_QUAD.map((p) => [...p]); $('#cropNote').textContent = '写真全体を読み取ります。'; draw(); };
+  $('#cropFull').onclick = () => { quad = FULL_QUAD.map((p) => [...p]); note('写真全体を読み取ります。'); draw(); };
 
-  const start = async (ocrCrop) => {
+  const start = async (ocrCrop, ocrRotate) => {
     decided = true;
-    await db.update('pages', id, { ocrCrop, updatedAt: Date.now() });
+    await db.update('pages', id, { ocrCrop, ocrRotate, updatedAt: Date.now() });
     go('#/page/' + id);
     await startAutoOcr([id], mode); // 「この範囲で読み取る」を押したので、自動で読む設定にかかわらず始める
   };
-  $('#cropGo').onclick = () => quad && start(quad.map(([x, y]) => [+x.toFixed(4), +y.toFixed(4)]));
-  $('#cropClear')?.addEventListener('click', () => start(null));
+  $('#cropGo').onclick = () => quad && start(quad.map(([x, y]) => [+x.toFixed(4), +y.toFixed(4)]), rotate);
+  $('#cropClear')?.addEventListener('click', () => start(null, null));
   // 撮影の直後に決めずに離れたときは、自動の範囲で読み取りを始める
   onLeave(() => { if (fromCapture && !decided) db.getSetting('ocrAuto', true).then((a) => a && startAutoOcr([id], mode)); });
 }

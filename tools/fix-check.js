@@ -78,6 +78,7 @@ export async function check(name, { image = `${name}.jpg`, clip = null, size = 1
     harmed: fixes.filter((x) => x.wasRight && !x.nowRight),
     helped: fixes.filter((x) => !x.wasRight && x.nowRight),
     bars: r.bars, // 縦棒の長さ（字の大きさの何倍か）
+    lowRatio: Object.fromEntries([96, 97, 98].map((th) => [th, r.low.filter(([, c]) => c < th).length / Math.max(1, after.length)])),
     time: r.time,
     pre: r.pre,
   };

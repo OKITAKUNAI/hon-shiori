@@ -12,7 +12,7 @@ import * as marksMod from './marks.js';
 import { renderText } from './textview.js';
 import { MON_TO_MA } from './fix-words.js';
 import { exportBackup, importBackup } from './backup.js';
-import { editedOf, lowConfIn, autoFixedIn, alignMap } from './text.js';
+import { editedOf, lowConfIn, autoFixedIn, alignMap, ocrLooksBroken } from './text.js';
 
 const TEST_DB = 'hon-shiori-test';
 const list = document.getElementById('results');
@@ -675,6 +675,77 @@ async function run() {
     assert(Math.abs(total) >= 1 && Math.abs(total) <= 2, `推定した角度 ${res.info.autoAngle} + ${res.info.angle}`);
     assert(Math.abs(after) <= 0.3, `補正後に残った傾き ${after}`);
     return `推定 ${res.info.autoAngle}度（切り抜きの段階）＋ ${res.info.angle}度（残り）→ 補正後に残った傾き ${after}度`;
+  });
+
+  await test('前処理2b：大きな傾き（8度）も推定して補正できる（探す範囲は±10度）', async () => {
+    const big = drawRubyPage({ w: 1500, h: 2000, skew: 8, shadow: true, outside: true });
+    const W = big.canvas.width;
+    const H = big.canvas.height;
+    const res = P.runPipeline(grayOf(big.canvas), W, H, { crop: 'auto', deskew: true, vertical: true });
+    const sm = P.downscale(res.g, res.w, res.h, 900);
+    const after = P.estimateSkew(P.charInk(P.binarizeSauvola(sm.g, sm.w, sm.h), sm.w, sm.h), sm.w, sm.h, true);
+    // 範囲の推定の段階で8度前後と推定できること。四隅を写真の内側に収めて引き伸ばすので、残りの補正（angle）は0にならないことがある
+    assert(Math.abs(Math.abs(res.info.autoAngle) - 8) <= 0.5, `推定した角度 ${res.info.autoAngle}`);
+    assert(Math.abs(after) <= 0.4, `補正後に残った傾き ${after}`);
+    return `推定 ${res.info.autoAngle}度 ＋ ${res.info.angle}度 → 補正後に残った傾き ${after}度`;
+  });
+
+  await test('前処理2c：ページの端の線・指のような大きな黒いかたまりがあっても、傾きは文字の列で推定する', async () => {
+    const pg = drawRubyPage({ w: 1500, h: 2000, skew: 3 });
+    const g2 = pg.canvas.getContext('2d');
+    g2.fillStyle = '#111';
+    g2.fillRect(1380, 0, 6, 2000);        // まっすぐなページの端の線
+    g2.fillRect(1300, 1500, 200, 500);    // 指
+    g2.fillRect(0, 1850, 1500, 150);      // ページの外の暗い部分
+    const W = pg.canvas.width;
+    const H = pg.canvas.height;
+    const sm = P.downscale(grayOf(pg.canvas), W, H, 800);
+    const ink = P.binarizeSauvola(sm.g, sm.w, sm.h);
+    const plain = P.estimateSkew(ink, sm.w, sm.h, true);
+    const chars = P.estimateSkew(P.charInk(ink, sm.w, sm.h), sm.w, sm.h, true);
+    assert(Math.abs(Math.abs(chars) - 3) <= 0.5, `文字のかたまりだけで推定した角度 ${chars}（そのままだと ${plain}）`);
+    return `文字のかたまりだけ ${chars}度 ／ そのまま ${plain}度（正しくは3度）`;
+  });
+
+  await test('範囲の自動推定：本文が見つからないときは found が false になる（写真全体を黙って使わない）', async () => {
+    const c = document.createElement('canvas');
+    c.width = 900; c.height = 1200;
+    const g = c.getContext('2d');
+    g.fillStyle = '#ece6da'; g.fillRect(0, 0, 900, 1200);
+    for (let i = 0; i < 300; i++) { g.fillStyle = 'rgba(0,0,0,0.05)'; g.fillRect(Math.random() * 900, Math.random() * 1200, 2, 2); }
+    const blank = P.autoQuad(grayOf(c), 900, 1200, true);
+    const page = P.autoQuad(grayOf(hard.canvas), HW, HH, true);
+    assert(blank.found === false, '文字のない紙で範囲が見つかったことになっている');
+    assert(page.found === true, '本文のあるページで範囲が見つからない');
+    return `文字のない紙：found ${blank.found} ／ 本文のあるページ：found ${page.found}`;
+  });
+
+  await test('手で指定した傾き：画面で右回りに回したのと同じ向きに回し、自動の傾き補正はしない', async () => {
+    // 右上に黒い点のある画像を、同じ大きさのまま「右に20度」回すと、点は右下へ動く（CSS の rotate(20deg) と同じ）
+    const c = document.createElement('canvas');
+    c.width = 200; c.height = 200;
+    const g = c.getContext('2d');
+    g.fillStyle = '#fff'; g.fillRect(0, 0, 200, 200);
+    g.fillStyle = '#000'; g.fillRect(140, 20, 20, 20);
+    const r = P.runPipeline(grayOf(c), 200, 200, { rotate: 20, deskew: true, vertical: true });
+    let sx = 0; let sy = 0; let n = 0;
+    for (let y = 0; y < r.h; y++) for (let x = 0; x < r.w; x++) if (r.g[y * r.w + x] < 128) { sx += x; sy += y; n++; }
+    const [cx, cy] = [sx / n, sy / n];
+    // 中心からの位置 (50, -70) を右に20度回すと (70.9, -48.7)
+    assert(r.w === 200 && r.h === 200, `大きさが変わった ${r.w}×${r.h}`);
+    assert(Math.abs(cx - 170.9) < 3 && Math.abs(cy - 51.3) < 3, `点の位置 ${cx.toFixed(1)}, ${cy.toFixed(1)}`);
+    assert(r.info.rotate === 20 && r.info.angle === undefined, JSON.stringify(r.info));
+    return `点の中心 (${cx.toFixed(1)}, ${cy.toFixed(1)})（期待 170.9, 51.3）・自動の傾き補正なし`;
+  });
+
+  await test('読み取りが崩れているかもしれないとき（信頼度98未満の字が15%以上）を見分ける', async () => {
+    const text = 'あ'.repeat(100);
+    const lows = (n, c = 90) => Array.from({ length: n }, (_, i) => [i, c]);
+    assert(!ocrLooksBroken({ ocrText: text, ocrLow: lows(9) }), '9%で崩れていると判断した');
+    assert(!ocrLooksBroken({ ocrText: text, ocrLow: lows(14) }), '14%で崩れていると判断した');
+    assert(ocrLooksBroken({ ocrText: text, ocrLow: lows(15) }), '15%で崩れていると判断しない');
+    assert(!ocrLooksBroken({ ocrText: text, ocrLow: lows(30, 98.5) }), '信頼度98以上を数えた');
+    assert(!ocrLooksBroken({ ocrText: 'あ'.repeat(30), ocrLow: lows(20) }), '短い文章で判断した');
   });
 
   await test('前処理3：影のある紙の部分を、Sauvola法は文字と間違えない（大津の方法と比べる）', async () => {

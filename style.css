@@ -404,8 +404,16 @@ dialog.viewer .zoom-frame img { height: 100%; }
 
 /* ---- 読み取り範囲（四隅の指定） ---- */
 .crop-title { margin: 4px 0; font-size: 1.2rem; }
-.crop-stage { position: relative; width: fit-content; max-width: 100%; margin: 8px auto; touch-action: none; user-select: none; }
-.crop-stage img { display: block; max-width: 100%; max-height: 62vh; border-radius: 8px; }
+.crop-stage { position: relative; width: fit-content; max-width: 100%; margin: 8px auto; touch-action: none; user-select: none; overflow: hidden; border-radius: 8px; background: #2a2320; }
+.crop-stage img { display: block; max-width: 100%; max-height: 62vh; transform-origin: 50% 50%; }
+.crop-svg line.crop-guide { stroke: rgba(255, 255, 255, 0.55); stroke-width: 1; stroke-dasharray: 4 4; }
+.crop-rotate { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.crop-rotate input[type=range] { flex: 1; min-width: 0; accent-color: #d9668a; }
+.crop-rotate label { white-space: nowrap; }
+#cropNote.warn { color: #b8442f; font-weight: 700; }
+.ocr-notice { margin: 8px 0; padding: 10px 12px; border-radius: 12px; background: #fff3e6; border: 1px solid #f1c79a; }
+.ocr-notice p { margin: 0 0 8px; color: #8a4a12; }
+.shoot-tip { margin: 6px 2px 0; }
 .crop-svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .crop-svg polygon { fill: rgba(240, 141, 166, 0.16); stroke: #d9668a; stroke-width: 2; }
 .crop-handle {

@@ -179,6 +179,17 @@ export function warpQuad(g, w, h, quad) {
   return { g: out, w: W, h: H };
 }
 
+// 紙の明るさの目安（明るいほうから10%の位置の明るさ）
+function paperLevel(g) {
+  const hist = new Uint32Array(256);
+  const step = Math.max(1, Math.floor(g.length / 200000));
+  let n = 0;
+  for (let i = 0; i < g.length; i += step) { hist[g[i]]++; n++; }
+  let acc = 0;
+  for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc >= n * 0.1) return v; }
+  return 255;
+}
+
 // 4組の対応点から射影変換の係数を求める（8元連立方程式をガウスの消去法で解く）
 function homography(src, dst) {
   const A = [];
@@ -201,14 +212,17 @@ function homography(src, dst) {
   return A.map((row, i) => row[8] / row[i]);
 }
 
-// 角度 deg だけ回転する（はみ出さないよう広げ、余白は端の画素で埋める）
-export function rotateGray(g, w, h, deg) {
+// 角度 deg だけ回転する（はみ出さないよう広げ、余白は端の画素で埋める）。
+// 画面の上では、deg が正なら左回り（CSS の rotate(-deg) と同じ見え方）。
+// keep：大きさを変えずに回す（はみ出した部分は切れる。読み取り範囲の画面で写真を回したときと同じ）
+// fill：写真の外にはみ出したところを埋める明るさ（省くと端の画素をのばして埋める）
+export function rotateGray(g, w, h, deg, { keep = false, fill = null } = {}) {
   if (!deg) return { g, w, h };
   const t = (deg * Math.PI) / 180;
   const c = Math.cos(t);
   const s = Math.sin(t);
-  const W = Math.ceil(Math.abs(w * c) + Math.abs(h * s));
-  const H = Math.ceil(Math.abs(w * s) + Math.abs(h * c));
+  const W = keep ? w : Math.ceil(Math.abs(w * c) + Math.abs(h * s));
+  const H = keep ? h : Math.ceil(Math.abs(w * s) + Math.abs(h * c));
   const cx = w / 2;
   const cy = h / 2;
   const CX = W / 2;
@@ -218,7 +232,9 @@ export function rotateGray(g, w, h, deg) {
     for (let x = 0; x < W; x++) {
       const dx = x - CX;
       const dy = y - CY;
-      out[y * W + x] = bilinear(g, w, h, cx + dx * c - dy * s, cy + dx * s + dy * c);
+      const sx = cx + dx * c - dy * s;
+      const sy = cy + dx * s + dy * c;
+      out[y * W + x] = fill !== null && (sx < -0.5 || sy < -0.5 || sx > w - 0.5 || sy > h - 0.5) ? fill : bilinear(g, w, h, sx, sy);
     }
   }
   return { g: out, w: W, h: H };
@@ -288,9 +304,51 @@ export function estimateTextBox(ink, w, h, vertical = true) {
   return { x0: Math.max(0, box.x0 - padX), y0: Math.max(0, box.y0 - padY), x1: Math.min(w, box.x1 + padX), y1: Math.min(h, box.y1 + padY) };
 }
 
+// 文字くらいの大きさの黒いかたまりだけを残した二値画像を返す（傾きと本文の範囲の推定用）。
+// ページの端の線・影・指・ページの外の暗い部分は、文字よりずっと大きなかたまりになるので除く。
+// かたまりの大きさ（縦横の長いほう）の中央値を文字の部品の大きさの目安にし、その4倍より大きいもの、
+// 細長い線（長さが目安の2倍以上で、縦横の比が6倍以上）、2点以下の点を除く
+export function charInk(ink, w, h) {
+  const label = new Int32Array(w * h).fill(-1);
+  const comps = [];
+  const stack = [];
+  for (let i = 0; i < w * h; i++) {
+    if (!ink[i] || label[i] >= 0) continue;
+    const id = comps.length;
+    let x0 = w; let x1 = -1; let y0 = h; let y1 = -1; let n = 0;
+    label[i] = id;
+    stack.push(i);
+    while (stack.length) {
+      const k = stack.pop();
+      const x = k % w;
+      const y = (k - x) / w;
+      n++;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        const nk = ny * w + nx;
+        if (ink[nk] && label[nk] < 0) { label[nk] = id; stack.push(nk); }
+      }
+    }
+    comps.push({ w: x1 - x0 + 1, h: y1 - y0 + 1, n });
+  }
+  const sizes = comps.map((c) => Math.max(c.w, c.h)).filter((s) => s >= 3);
+  const m = median(sizes) || 1;
+  const keep = comps.map((c) => {
+    const s = Math.max(c.w, c.h);
+    const thin = Math.min(c.w, c.h);
+    return s >= 3 && s <= m * 4 && !(s >= m * 2 && s >= thin * 6);
+  });
+  const out = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) if (label[i] >= 0 && keep[label[i]]) out[i] = 1;
+  return out;
+}
+
 // 行の傾きを推定する。黒画素を少しずつ斜めにずらして、行の分布が最もくっきりする角度を探す
 // 戻り値は「この角度だけ回転すれば行がまっすぐになる」角度（rotateGray にそのまま渡せる）
-export function estimateSkew(ink, w, h, vertical = true, { range = 6, maxPoints = 60000 } = {}) {
+export function estimateSkew(ink, w, h, vertical = true, { range = 10, maxPoints = 60000 } = {}) {
   const pts = [];
   let count = 0;
   for (let i = 0; i < ink.length; i++) if (ink[i]) count++;
@@ -382,9 +440,11 @@ export function removeRuby(ink, w, h, vertical = true, { ratio = 0.6 } = {}) {
 // 見つけた長方形の四隅を元の写真の座標に戻す（ページの傾きに沿った四角形になる）
 export function autoQuad(g, w, h, vertical = true) {
   const small = downscale(g, w, h, 800);
-  const angle = estimateSkew(binarizeSauvola(small.g, small.w, small.h), small.w, small.h, vertical);
+  const angle = estimateSkew(charInk(binarizeSauvola(small.g, small.w, small.h), small.w, small.h), small.w, small.h, vertical);
   const rot = rotateGray(small.g, small.w, small.h, angle);
-  const b = estimateTextBox(binarizeSauvola(rot.g, rot.w, rot.h), rot.w, rot.h, vertical);
+  const b = estimateTextBox(charInk(binarizeSauvola(rot.g, rot.w, rot.h), rot.w, rot.h), rot.w, rot.h, vertical);
+  // 本文の範囲が見つからない：回転した画像のほぼ全体（縦横とも97%以上）になったとき
+  const found = (b.x1 - b.x0) < rot.w * 0.97 || (b.y1 - b.y0) < rot.h * 0.97;
   const t = (angle * Math.PI) / 180;
   const c = Math.cos(t);
   const sn = Math.sin(t);
@@ -394,13 +454,22 @@ export function autoQuad(g, w, h, vertical = true) {
     const dy = y - rot.h / 2;
     return [(small.w / 2 + dx * c - dy * sn) / small.s, (small.h / 2 + dx * sn + dy * c) / small.s];
   };
+  // 四隅は写真の内側に収める（外にはみ出させて紙の明るさで埋める方法も試したが、p9 の一致率が 98.4% → 95.6% に下がった）
   const clamp = ([x, y]) => [Math.min(w, Math.max(0, x)), Math.min(h, Math.max(0, y))];
-  return { angle, quad: [back(b.x0, b.y0), back(b.x1, b.y0), back(b.x1, b.y1), back(b.x0, b.y1)].map(clamp) };
+  // 読み取り範囲の画面用：写真を画面の上で rotate 度（右回りが正）回したときの、本文を囲む長方形（0〜1 の割合）
+  const ox = (rot.w - small.w) / 2;
+  const oy = (rot.h - small.h) / 2;
+  const fx = (x) => Math.min(1, Math.max(0, (x - ox) / small.w));
+  const fy = (y) => Math.min(1, Math.max(0, (y - oy) / small.h));
+  const rect = [[fx(b.x0), fy(b.y0)], [fx(b.x1), fy(b.y0)], [fx(b.x1), fy(b.y1)], [fx(b.x0), fy(b.y1)]];
+  return { angle, found, rotate: -angle || 0, rect, quad: [back(b.x0, b.y0), back(b.x1, b.y0), back(b.x1, b.y1), back(b.x0, b.y1)].map(clamp) };
 }
 
 // ---------- まとめて実行 ----------
 
 // options:
+//   rotate    null（自動）／数値：手で指定した傾き（度。画面の上で右回りが正）。写真を同じ大きさのまま回してから切り抜き、
+//             自動の傾き補正はしない。crop の四隅は回したあとの写真の上の位置
 //   crop      null（切り抜かない）／'auto'（自動推定）／[[x,y]×4]（四隅。0〜1 の割合）
 //   deskew    true で傾き補正
 //   binarize  'none' | 'otsu' | 'sauvola'
@@ -409,8 +478,15 @@ export function autoQuad(g, w, h, vertical = true) {
 //   debug     true で、ルビとして消した部分を赤で示した確認用の画像も返す
 // 戻り値：{ g, w, h, ink（二値化したとき）, info }
 export function runPipeline(g, w, h, options = {}) {
-  const o = { crop: null, deskew: false, binarize: 'none', removeRuby: false, vertical: true, ...options };
+  const o = { crop: null, deskew: false, binarize: 'none', removeRuby: false, vertical: true, rotate: null, ...options };
   const info = { size: [w, h] };
+  const manualAngle = typeof o.rotate === 'number';
+
+  // 0. 手で指定した傾き（読み取り範囲の画面で回したのと同じ見え方にする）
+  if (manualAngle) {
+    info.rotate = o.rotate;
+    ({ g, w, h } = rotateGray(g, w, h, -o.rotate, { keep: true, fill: paperLevel(g) }));
+  }
 
   // 1. 切り抜き
   if (Array.isArray(o.crop)) {
@@ -423,6 +499,7 @@ export function runPipeline(g, w, h, options = {}) {
     info.crop = 'auto';
     info.quad = a.quad.map(([x, y]) => [+(x / w).toFixed(4), +(y / h).toFixed(4)]);
     info.autoAngle = a.angle;
+    info.cropFound = a.found;
     ({ g, w, h } = warpQuad(g, w, h, a.quad));
   }
 
@@ -430,9 +507,9 @@ export function runPipeline(g, w, h, options = {}) {
   info.range = normalizeContrast(g);
 
   // 3. 傾き補正（自動の切り抜きで直したあとに残ったぶんも、ここで直す）
-  if (o.deskew) {
+  if (o.deskew && !manualAngle) {
     const small = downscale(g, w, h, 900);
-    const angle = estimateSkew(binarizeSauvola(small.g, small.w, small.h), small.w, small.h, o.vertical);
+    const angle = estimateSkew(charInk(binarizeSauvola(small.g, small.w, small.h), small.w, small.h), small.w, small.h, o.vertical);
     info.angle = angle;
     if (Math.abs(angle) >= 0.1) ({ g, w, h } = rotateGray(g, w, h, angle));
   }
@@ -561,6 +638,8 @@ export async function suggestCrop(blob, vertical = true) {
   const cg = c.getContext('2d', { willReadFrequently: true });
   cg.drawImage(bmp, 0, 0, W, H);
   bmp.close?.();
-  const { quad } = autoQuad(toGray(cg.getImageData(0, 0, W, H).data, W, H), W, H, vertical);
-  return quad.map(([x, y]) => [+(x / W).toFixed(4), +(y / H).toFixed(4)]);
+  // 戻り値：{ found（本文の範囲が見つかったか）, rotate（画面で回す角度。右回りが正）, rect（回した写真の上で本文を囲む長方形） }
+  const a = autoQuad(toGray(cg.getImageData(0, 0, W, H).data, W, H), W, H, vertical);
+  const r4 = (q) => q.map(([x, y]) => [+x.toFixed(4), +y.toFixed(4)]);
+  return { found: a.found, rotate: Math.round(a.rotate * 10) / 10, rect: r4(a.rect) };
 }

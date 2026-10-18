@@ -46,6 +46,17 @@ export function adoptedText(page) {
 export const LOW_CONF_LEVELS = { 96: '少なめ（96）', 97: 'やや少なめ（97）', 98: 'ふつう（98・既定）' };
 export const LOW_CONF_DEFAULT = 98;
 
+// 読み取りが崩れているかもしれないときの目安：信頼度98未満の字が、読み取った字（空白を除く）の15%以上。
+// うまく読めた写真（一致率97〜98%：p9・p7）は 6.8〜9.5%、崩れた写真（86〜87%）は 21〜27%、それ以下は 40%以上だった。
+// 印の量の設定（lowConfLevel）とは関係なく、この基準で判断する。短い文章（40字未満）では判断しない
+export const BROKEN_CONF = 98;
+export const BROKEN_RATIO = 0.15;
+export function ocrLooksBroken(page) {
+  const n = (page.ocrText || '').replace(/\s/g, '').length;
+  if (n < 40 || !page.ocrLow) return false;
+  return page.ocrLow.filter(([, c]) => c < BROKEN_CONF).length / n >= BROKEN_RATIO;
+}
+
 // 2つの文章の文字を対応づける（最長共通部分列）。a の各位置に対応する b の位置（なければ -1）を返す。
 // 手直しはふつう一部分なので、前後の一致する部分を先に除いてから計算する
 export function alignMap(a, b) {

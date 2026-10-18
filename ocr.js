@@ -45,7 +45,9 @@ export async function preSettings() {
 // ページの読み取りに使う前処理：四隅の指定（ocrCrop）があればそれ、なければ設定に応じて自動推定
 export async function preFor(page) {
   const s = await preSettings();
-  return { crop: page.ocrCrop || (s.autoCrop ? 'auto' : null), deskew: s.deskew, binarize: s.binarize, removeRuby: s.removeRuby };
+  // 傾きを手で指定していれば（ocrRotate）、その角度で回してから四隅で切り抜き、自動の傾き補正はしない
+  const rotate = typeof page.ocrRotate === 'number' ? page.ocrRotate : null;
+  return { crop: page.ocrCrop || (s.autoCrop ? 'auto' : null), rotate, deskew: s.deskew, binarize: s.binarize, removeRuby: s.removeRuby };
 }
 
 export async function psmFor(mode) {
